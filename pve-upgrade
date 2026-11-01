@@ -1,0 +1,888 @@
+#!/bin/bash
+# pve-upgrade - Proxmox VE 8 -> 9 on one host, in phases.
+# Runs ON the host as root. Usage: pve-upgrade <host> [phase|all|init] [--apply] [--gpu yes|no] [--nfs-quiet] [--through-reboot]
+# <host> names hosts/<host>.conf (the profile); `pve-upgrade <host> init` prints a suggested one, read-only.
+# Phases: precheck preclean fetch drain to-8.4 prepare upgrade driver reboot recheck; ZFS_POOL= profiles add zpool checks, STAY= guests must be down.
+# DRY RUN by default: prints what each phase would run and the read-only checks' results (any FAIL -> exit 1); --apply
+# executes. State /root/pve-upgrade/state (the last finished phase) moves FORWARD only: `all --apply` resumes at the next
+# due phase, a single phase runs only when it is the due one. Log /root/pve-upgrade/log (every command, its rc, a
+# timestamp). The first failed check stops it with ONE line on stderr: `STOP <phase>: <check>: <seen>`. Every --apply
+# first checks the guards: hostname = profile, the GPU decision, and (phases that change the host) no guest, no GUARD_PROCS process.
+# --apply is the gate (no prompt); each point of no return logs `APPLY <phase> on <host>`. A GPU mismatch STOPs;
+# `--gpu yes|no` settles it. Never touches corosync, /etc/pve, storage config, guests, the router or
+# /etc/network/interfaces: NIC names are pinned to their CURRENT names by systemd .link files.
+set -uo pipefail
+PHASES=(precheck preclean fetch drain to-8.4 prepare upgrade driver reboot recheck)
+BK_WINDOW_MIN=30   # a backup job due within this many minutes STOPs upgrade and reboot
+MAINT_CONFFILES=(/etc/lvm/lvm.conf /etc/chrony/chrony.conf)   # take the maintainer's version; every other conffile keeps local
+APT=(env DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+die() { echo "pve-upgrade: $*" >&2; exit 2; }
+# the fake root is honoured only when not root: a real run (uid 0) always works on /; non-root without it is refused
+if [ "$(id -u)" = 0 ]; then R=""
+else [ -n "${PVEU_TEST_ROOT:-}" ] || die "run as root"; R="$PVEU_TEST_ROOT"; fi
+S="$R/root/pve-upgrade"; LOG="$S/log"; STATE="$S/state"; GPUF="$S/gpu"; BAK="$S/etc-before-pve9.tgz"
+LINKD="$R/usr/local/lib/systemd/network"
+
+HOST="${1:-}"; WHAT=all; APPLY=0; GPUARG=""; NFSQ=0; THRU=0
+[ -n "$HOST" ] || die "usage: pve-upgrade <host> [phase|all] [--apply] [--gpu yes|no] [--nfs-quiet] [--through-reboot]"
+[[ "$HOST" =~ ^[a-z0-9-]+$ ]] || die "host must match ^[a-z0-9-]+\$, not '$HOST'"
+shift; while [ $# -gt 0 ]; do case "$1" in
+  --apply) APPLY=1;;
+  --nfs-quiet) NFSQ=1;;
+  --through-reboot) THRU=1;;   # all --apply otherwise pauses after driver: the reboot is announced first (the operator is at the console)
+  --gpu) [ $# -ge 2 ] || die "--gpu needs yes|no"; GPUARG="$2"; shift;;
+  *) WHAT="$1";; esac; shift; done
+[ -z "$GPUARG" ] || [[ "$GPUARG" =~ ^(yes|no)$ ]] || die "--gpu yes|no, not '$GPUARG'"
+[ "$WHAT" = all ] || [ "$WHAT" = init ] || [[ " ${PHASES[*]} " == *" $WHAT "* ]] || die "unknown phase $WHAT (${PHASES[*]})"
+init_profile() {  # read-only: a SUGGESTED hosts/<host>.conf from detection, one comment per line; nothing is written
+  local n g z p ce="" st="" l
+  echo "# suggested hosts/$HOST.conf - from detection on $(hostname -s); check every line, then save it yourself"
+  echo "# the hostname the guards compare against (hostname -s)"; echo "NAME=$(hostname -s)"
+  g="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')"
+  if [ "${g:-0}" -gt 0 ]; then echo "# nvidia-smi -L lists $g card(s)"; echo "NVIDIA=yes"; echo "# the card count recheck expects"; echo "GPUS=$g"
+  else echo "# nvidia-smi -L lists no card"; echo "NVIDIA=no"; fi
+  echo "# NICS=\"name ...\"   physical NICs whose offloads recheck verifies; none detected by init"
+  z="$(zpool list -H -o name 2>/dev/null | grep -vx "$(findmnt -n -o SOURCE / 2>/dev/null | cut -d/ -f1)" | head -1)"
+  if [ -n "$z" ]; then echo "# zpool list shows $z (not the root pool)"; echo "ZFS_POOL=$z"; else echo "# no data ZFS pool found"; echo "#ZFS_POOL="; fi
+  if [ -s "$R/etc/exports" ] && grep -qEv '^[[:space:]]*(#|$)' "$R/etc/exports"; then echo "# /etc/exports is not empty: this node serves NFS"; echo "NFS_SERVER=yes"
+  else echo "# /etc/exports is empty or missing"; echo "NFS_SERVER=no"; fi
+  if pvecm status >/dev/null 2>&1; then echo "# pvecm status answers: a cluster member"; echo "CLUSTER=yes"
+  else echo "# pvecm status does not answer: a single node"; echo "CLUSTER=no"; fi
+  p="$(timeout 60 pvesm status 2>/dev/null | awk '$2 == "nfs" {print $1}' | head -1)"
+  if [ -n "$p" ]; then echo "# pvesm lists an nfs storage '$p'"; echo "SHARED=/mnt/pve/$p"; else echo "# pvesm lists no nfs storage"; echo "SHARED=\"\""; fi
+  ce="$(timeout 60 pvesm status 2>/dev/null | awk '$2 == "rbd" || $2 == "cephfs" {print $1}' | head -1)"
+  [ -n "$ce" ] || ce="$(systemctl list-units --state=active --plain --no-legend 'ceph-*@*' 2>/dev/null | head -1)"
+  if [ -n "$ce" ]; then echo "# Ceph found: $ce"; echo "CEPH=yes"; else echo "# no Ceph storage or daemon found (this excuses pve8to9's three Ceph-status FAILs)"; echo "CEPH=no"; fi
+  st="$( { qm list 2>/dev/null | awk 'NR>1 && $3=="running"{print $1}'; pct list 2>/dev/null | awk 'NR>1 && $2=="running"{print $1}'; } | tr '\n' ' ')"
+  echo "# running guests now: the ones that must stay up are listed in STAY and must be down (shut down by hand) before the window"
+  echo "#STAY=\"${st% }\""
+  echo "# GUARD_PROCS=\"name ...\"   processes that block every host-changing phase; HOLD_HINT=\"...\"   what to run before the drain"
+}
+PROF="$HERE/hosts/$HOST.conf"
+if [ "$WHAT" = init ]; then [ "$APPLY" = 0 ] || die "init is read-only: no --apply"; init_profile; exit 0; fi
+[ -f "$PROF" ] || die "no profile $PROF - run: $0 $HOST init   (prints a suggested one)"
+NAME=""; NVIDIA=""; GPUS=""; ZFS_POOL=""; STAY=""; NICS=""; UNITS=""; FILES=""; GUARD_PROCS=""; HOLD_HINT=""; OLD_TOKEN_USER=""; NV_RUN=""; NV_SHA256=""; CLUSTER=yes; SHARED=""; NFS_SERVER=no; CEPH=""; SUBSCRIPTION=""; REMOVE_OK=""   # REMOVE_OK="pkg ...": removals upgrade accepts (not t64 renames)
+# shellcheck source=/dev/null
+. "$PROF"
+if [ -f "$HERE/driver.conf" ]; then NV_RUN_P="$NV_RUN"; NV_SHA_P="$NV_SHA256"; . "$HERE/driver.conf"; NV_RUN="${NV_RUN_P:-$NV_RUN}"; NV_SHA256="${NV_SHA_P:-$NV_SHA256}"; fi   # the profile wins; --gpu yes on a NVIDIA=no node needs it too
+if [ "$NVIDIA" = yes ] && { [ -z "$NV_RUN" ] || [ -z "$NV_SHA256" ]; }; then die "NVIDIA=yes needs NV_RUN and NV_SHA256 (profile) or $HERE/driver.conf (see driver.conf.example)"; fi
+[ -n "$NAME" ] && [[ "$NVIDIA" =~ ^(yes|no)$ ]] || die "profile $PROF needs NAME and NVIDIA=yes|no"
+[ "$NVIDIA" = no ] || [[ "$GPUS" =~ ^[0-9]+$ ]] || die "profile $PROF: NVIDIA=yes needs GPUS=<n> (0 = no card, module checks only)"
+GPUS="${GPUS:-0}"
+[[ "${SUBSCRIPTION:-no}" =~ ^(yes|no)$ ]] || die "profile $PROF: SUBSCRIPTION=yes|no, not '$SUBSCRIPTION'"
+NV_PATH="$S/$NV_RUN"
+
+ts() { date '+%F %T'; }
+logl() { [ "$APPLY" = 1 ] && echo "$(ts) $*" >> "$LOG"; return 0; }
+say() { echo "  $*"; logl "$*"; }
+stop() { logl "STOP $PH: $1: $2"; echo "STOP $PH: $1: $2" >&2; exit 1; }
+# act: a command that changes the host - printed in a dry run, run + logged with its rc under --apply; never reads a tty
+act() {
+  if [ "$APPLY" = 0 ]; then echo "  would: $*"; return 0; fi
+  echo "$(ts) run: $*" >> "$LOG"; "$@" < /dev/null >> "$LOG" 2>&1; local rc=$?
+  echo "$(ts) rc=$rc: $*" >> "$LOG"; return $rc
+}
+# put <file> <text>: write a file under --apply (logged), print it in a dry run; the file always ends in a newline
+put() { if [ "$APPLY" = 1 ]; then local t="$2"; [[ "$t" == *$'\n' ]] || t+=$'\n'
+          mkdir -p "$(dirname "$1")" && printf '%s' "$t" > "$1" || stop write "cannot write $1"
+          sync "$1" "$(dirname "$1")" || stop write "cannot sync $1"; logl "wrote $1"
+        else echo "  would write: ${1#"$R"}"; fi; }
+# q: a read-only query - runs in both modes, its output to stdout, logged under --apply
+wr() { { printf '%s\n' "$2" > "$1.tmp" && sync "$1.tmp" && mv -f "$1.tmp" "$1"; } || stop write "cannot write $1"
+       sync "$(dirname "$1")" || stop write "$1 is in place but its directory sync failed - rerun"; }   # wr <file> <text>: via .tmp + sync + mv - a power cut leaves the old file or the new, never an empty one
+q() { local out rc; out="$("$@" 2>&1 < /dev/null)"; rc=$?; logl "query rc=$rc: $*"; printf '%s' "$out"; return $rc; }
+# chk name ok seen: a failed check stops under --apply; a dry run prints it and goes on (and exits 1 at the end)
+chk() {
+  if [ "$2" = 1 ]; then echo "  check $1: ok"; logl "check $1: ok ($3)"; return 0; fi
+  [ "$APPLY" = 1 ] && stop "$1" "$3"
+  echo "  check $1: FAIL - $3"; DRYFAIL=1
+}
+# after-the-fact checks cannot be judged before the action ran
+later() { [ "$APPLY" = 1 ] || { echo "  would check: $*"; return 1; }; }
+
+mark() {      # mark <what>: a point of no return - --apply is the gate; one log line
+  [ "$APPLY" = 1 ] || { echo "  would log: APPLY $1 on $HOST"; return 0; }
+  echo "APPLY $1 on $HOST"; logl "APPLY $1 on $HOST"
+}
+mismatch() {  # profile and detection disagree: never guess - stop, --gpu yes|no settles it
+  local msg="profile says nvidia=$NVIDIA, detected ${DETECTED:-nothing}"
+  echo "  driver: profile and detection disagree ($msg) - --apply will stop; settle with --gpu yes|no"
+  [ "$APPLY" = 1 ] || { DRYFAIL=1; return 0; }
+  PH=driver; stop "gpu decision" "$msg - rerun with --gpu yes|no"
+}
+nvpk() { q dpkg-query -W -f '${Package} ${db:Status-Abbrev}\n' 'nvidia-*' 'libnvidia-*' | grep -v '^dpkg-query:' | awk '$2 !~ /^.[nc]/{print $1}' | tr '\n' ' '; }   # any installed state: a held (hi) one too, so apt's refusal STOPs at the purge
+detect() {    # an NVIDIA device (10de), installed nvidia-* packages, a loaded nvidia module
+  local o; DETECTED=""   # capture, then grep: under pipefail a feeder's rc would hide a match
+  o="$(q lspci -nn)"; grep '\[10de:' <<<"$o" > /dev/null && DETECTED+="card "
+  [ -n "$(nvpk)" ] && DETECTED+="nvidia-packages "
+  o="$(q lsmod)"; grep '^nvidia ' <<<"$o" > /dev/null && DETECTED+="module "
+  return 0
+}
+gpu_decide() {  # sets GPU=yes|no or stops; --gpu wins, then an earlier decision (the gpu file), then detection
+  if [ -n "$GPUARG" ]; then GPU=$GPUARG; say "driver: $GPU (--gpu $GPUARG, operator)"
+    [ "$APPLY" = 1 ] && echo "$GPU" > "$GPUF"; return; fi
+  if [ -f "$GPUF" ]; then GPU="$(cat "$GPUF")"; echo "  driver: $GPU (decided earlier, $GPUF)"; return; fi
+  detect; local det=no; [ -n "$DETECTED" ] && det=yes
+  if [ "$det" = "$NVIDIA" ]; then
+    GPU=$NVIDIA
+    if [ "$GPU" = no ]; then say "driver: skip - profile no, no card/driver/module found"
+    else say "driver: run - profile yes, found ${DETECTED% }"; fi
+    [ "$APPLY" = 1 ] && echo "$GPU" > "$GPUF"
+  else GPU=""; mismatch; fi
+}
+newk() {      # the kernel the reboot will boot: the next-boot pin, a pin, else the newest -pve in /boot; an unreadable list prints nothing, rc 1 (never the /boot guess)
+  local o p; o="$(q proxmox-boot-tool kernel list)" && grep -qE '^(Manually|Automatically) selected kernels:' <<<"$o" || return 1
+  p="$(awk '/^Kernel pinned on next-boot:/{getline; print $1; exit}' <<<"$o")"
+  [ -n "$p" ] || p="$(awk '/^Pinned kernel:/{getline; print $1; exit}' <<<"$o")"
+  [ -n "$p" ] && { echo "$p"; return 0; }
+  ls "$R/boot" | sed -n 's/^vmlinuz-//p' | sort -V | tail -1
+}
+# ours today is Debian's nvidia-current/535 (a Proxmox kernel update does not rebuild it); after the driver phase nvidia/580
+dkms_ok() { [ -n "$1" ] && q dkms status | grep -E "^nvidia(-current)?[/,].*, $1, [^:]*: installed" >/dev/null; }   # dkms_ok <kernel>: an empty one (an unreadable list) fails
+sha_ok() { [ -f "$NV_PATH" ] && [ "$(sha256sum "$NV_PATH" | cut -d' ' -f1)" = "$NV_SHA256" ]; }
+# pve8to9 passes ONLY with a `FAILURES: 0` line - a missing tool or an odd output is a failure, never a pass
+# pve8to9 colours its output even when piped: strip ANSI before every match. SDB_FAIL: the one FAIL prepare fixes.
+SDB_FAIL='^FAIL:.*systemd-boot meta-package'
+# CEPH=no (profile): on a host with no Ceph, pve8to9's three Ceph-status FAILs are excused; unset = no excuse
+CEPH_FAIL="^FAIL:.*(failed to get 'noout' flag status|unable to determine Ceph status!|unable to determine Ceph daemon versions!)"
+# Ceph is what runs or holds data here - never /etc/ceph/ceph.conf (on PVE a symlink to the CLUSTER file, on every node)
+ceph_found() { local st
+  CEPHSEEN="$(compgen -G "$R/etc/systemd/system/*/ceph-*@*" | grep -E '/ceph-(mon|osd|mgr|mds)@' | head -1)"; [ -z "$CEPHSEEN" ] || return 0
+  st="$(q systemctl list-units --state=active --plain --no-legend 'ceph-*@*')" || stop ceph "systemctl unreadable - cannot rule out a Ceph unit"
+  CEPHSEEN="$(grep -oE 'ceph-(mon|osd|mgr|mds)@[^[:space:]]*' <<<"$st" | head -1)"
+  [ -z "$CEPHSEEN" ] || { CEPHSEEN="active unit $CEPHSEEN"; return 0; }
+  CEPHSEEN="$(compgen -G "$R/var/lib/ceph/osd/*" | head -1)"; [ -z "$CEPHSEEN" ] || return 0
+  # a mon store with no enabled or active ceph-mon@ unit (caught above) is a leftover, not Ceph in use
+  st="$(q timeout 60 pvesm status)" || { [ $? = 124 ] && stop ceph "pvesm status timed out - cannot rule out Ceph storage"
+    stop ceph "pvesm status unreadable - cannot rule out Ceph storage"; }
+  # an rbd/cephfs storage counts unless disabled: an inactive one with dead mons is the broken-Ceph case
+  CEPHSEEN="$(awk '($2 == "rbd" || $2 == "cephfs") && $3 != "disabled" {print "storage " $1 " (" $2 ", " $3 ")"; exit}' <<<"$st")"; [ -z "$CEPHSEEN" ] || return 0
+  st="$(compgen -G "$R/var/lib/ceph/mon/*" | head -1)"; [ -z "$st" ] || say "ceph: stale mon store ${st#"$R"}, no unit - CEPH=no holds"
+  [ ! -e "$R/etc/ceph/ceph.conf" ] || say "ceph: /etc/ceph/ceph.conf present (cluster file), no Ceph daemon, data or storage here - CEPH=no holds"
+  return 1; }
+p89() { q pve8to9 --full | sed 's/\x1b\[[0-9;]*m//g'; }
+p89_ok() {    # p89_ok [sdb]: with sdb, the systemd-boot FAIL alone is "fixed by prepare" (logged), any other FAIL fails
+  local o n=0; command -v pve8to9 > /dev/null || { P89="pve8to9 missing - to-8.4 first"; return 1; }
+  o="$(p89)"; P89="$(grep -E '^(FAIL|FAILURES:)' <<<"$o" | tr '\n' ' ')"; P89="${P89:-no FAILURES line}"
+  if [ "${1:-}" = sdb ] && grep -E "$SDB_FAIL" <<<"$o" > /dev/null; then n=1; o="$(grep -Ev "$SDB_FAIL" <<<"$o")"
+    say "pve8to9: the systemd-boot meta-package FAIL - fixed by prepare"; fi
+  if [ "$CEPH" = no ] && grep -E "$CEPH_FAIL" <<<"$o" > /dev/null; then
+    ceph_found && stop ceph "CEPH=no but Ceph is on this host (${CEPHSEEN#"$R"}) - fix the profile"
+    local l; while IFS= read -r l; do n=$((n+1)); say "pve8to9: excused (CEPH=no, no Ceph here): ${l#FAIL: }"; done < <(grep -E "$CEPH_FAIL" <<<"$o")
+    o="$(grep -Ev "$CEPH_FAIL" <<<"$o")"; fi
+  grep -E "^FAILURES: *$n *\$" <<<"$o" > /dev/null && ! grep '^FAIL:' <<<"$o" > /dev/null; }
+quorate() { [ "$CLUSTER" = no ] || q pvecm status | grep -E '^Quorate: *Yes' > /dev/null; }
+b() { "$@" && echo 1 || echo 0; }
+
+running() {   # running guests (qm AND pct) and GUARD_PROCS processes; a failing qm/pct (pmxcfs down, ipcc error) is a FAIL, never "none"
+  local o; G=""; K=""; GERR=""
+  if o="$(q qm list)" && ! grep -qiE 'ipcc|pmxcfs' <<<"$o"; then G+="$(awk 'NR>1 && $3=="running"{printf "VM %s ", $1}' <<<"$o")"
+  else GERR+="qm list failed: ${o%%$'\n'*} "; fi
+  if o="$(q pct list)" && ! grep -qiE 'ipcc|pmxcfs' <<<"$o"; then G+="$(awk 'NR>1 && $2=="running"{printf "CT %s ", $1}' <<<"$o")"
+  else GERR+="pct list failed: ${o%%$'\n'*} "; fi
+  local gp; for gp in $GUARD_PROCS; do q pgrep -f "[${gp:0:1}]${gp:1}" > /dev/null && K+="$gp running "; done; K="${K% }"
+  local st="" v; for v in $STAY; do [[ " $G" == *" VM $v "* || " $G" == *" CT $v "* ]] && st+="$v "; done
+  chk stay "$(b [ -z "$st" ])" "stay guest(s) running: $st- shut down by hand; the script never starts, stops or migrates them"
+  [ -z "$G$K" ] || echo "  to do: ${HOLD_HINT:+$HOLD_HINT; }stop or migrate the guests and workloads listed: ${G:-none}${K:+ $K}"
+  chk guest-list "$(b [ -z "$GERR" ])" "${GERR}- is pmxcfs up? fix, then rerun"
+  chk guests "$(b [ -z "$G" ])" "still running here: $G- migrate (8->9) or shut down, then rerun${HOLD_HINT:+; $HOLD_HINT}"
+  [ -z "$GUARD_PROCS" ] || chk guard-procs "$(b [ -z "$K" ])" "$K - stop it${HOLD_HINT:+ ($HOLD_HINT)}, then rerun"
+}
+pinned() { sed -s -n 's/^Name=//p' "$LINKD"/*.link 2>/dev/null | sort -u; }   # -s: each file on its own (an older put wrote no final newline)
+nic_names() { # every NIC name the host's config uses: the profile's NICS, /etc/network/interfaces, nic-offload-* units
+  { for n in $NICS; do echo "$n"; done
+    sed -nE '/^[[:space:]]*#/d; s/^[[:space:]]*(auto|allow-hotplug|iface)[[:space:]]+([^[:space:]]+).*/\2/p; s/.*ethtool[[:space:]]+-K[[:space:]]+([^[:space:]]+).*/\1/p' \
+      "$R/etc/network/interfaces" 2>/dev/null
+    [ "${1:-}" = noservice ] || ls "$R/etc/systemd/system" 2>/dev/null | sed -n 's/^nic-offload-\(.*\)\.service$/\1/p'
+  } | sed 's/\..*//' | grep -v '^\$' | grep -vE '^(lo|vmbr[0-9]*|bond[0-9]*|)$' | sort -u; }
+unit_re() {   # a unit runs when active, or when its <u>.timer is active and <u> is not failed (a oneshot between runs)
+  q systemctl is-active "$1" > /dev/null && return 0
+  if [ "$(q systemctl is-failed "$1")" = failed ]; then bad+=("$1 failed")
+  elif ! q systemctl cat "$1.timer" > /dev/null 2>&1; then bad+=("$1 not active (no timer)")
+  elif ! q systemctl is-active "$1.timer" > /dev/null; then bad+=("$1.timer not active"); fi; }
+nic_missing() { # NIC names the config uses (not the profile's NICS) that look physical (en* eth* wl*) with no device: the stanzas are dead; a name only a nic-offload unit gives is gets "(nic-offload-<n>.service)" after it
+  local n tag; for n in $(comm -23 <(nic_names) <(for n in $NICS; do echo "$n"; done | sort -u)); do
+    [[ "$n" == en* || "$n" == eth* || "$n" == wl* ]] || continue
+    [ -e "$R/sys/class/net/$n" ] && continue
+    tag=""; grep -qx -- "$n" <(nic_names noservice) || tag="(nic-offload-$n.service)"; echo "$n$tag"; done; }
+port_missing() { # bridge-ports / bond-slaves names with no device: said, never a STOP (a bridge can come back with one)
+  local n; for n in $(sed -nE 's/^[[:space:]]*(bridge[-_]ports|bond[-_]slaves)[[:space:]]+(.*)/\2/p' "$R/etc/network/interfaces" 2>/dev/null | tr ' ' '\n' | sed 's/\..*//' | grep -vE '^(none|)$' | sort -u); do
+    [ -e "$R/sys/class/net/$n" ] || echo "$n"; done; }
+nics_ok() { local miss; miss="$(comm -23 <(nic_names) <(pinned) | tr '\n' ' ')"; NICMISS="${miss:-}"; [ -z "$miss" ]; }
+zfs_health() { local o; o="$(q zpool status -x "$1")"; chk zfs-health "$(b grep -q 'is healthy' <<<"$o")" "zpool status -x $1: ${o%%$'\n'*}"; }
+reboot_now() {  # reboot_now <state-to-record>: refused while nvidia is not built for the kernel it boots or a pool is unhealthy
+  [ -z "$ZFS_POOL" ] || { zfs_health "$ZFS_POOL"; zfs_cache "$ZFS_POOL"; }
+  [ "$(cat "$S/rootfs" 2>/dev/null)" != zfs ] || zfs_health "$(q findmnt -n -o SOURCE / | cut -d/ -f1)"
+  local pk nk; nk="$(newk)" || stop kernel-pin "cannot read the kernel list"
+  if [ "${GPU:-}" = yes ]; then chk dkms "$(b dkms_ok "$nk")" "nvidia not built for the new kernel $nk - reboot refused"; fi
+  mark reboot
+  local prev rc; prev="$(cat "$STATE" 2>/dev/null)"
+  pk="$(cat "$S/expect-kernel" 2>/dev/null)"
+  [ "$APPLY" = 1 ] && { wr "$S/expect-kernel" "$nk"; wr "$STATE" "$1"; }   # the record first: a power cut between leaves the old state beside it, never state=reboot beside the old record
+  act reboot && return 0
+  rc=$?; if [ -n "$prev" ]; then wr "$STATE" "$prev"; else rm -f "$STATE"; fi   # the state and record it replaced: the reboot never came
+  if [ -n "$pk" ]; then wr "$S/expect-kernel" "$pk"; else rm -f "$S/expect-kernel"; fi
+  stop reboot "the reboot command failed (rc $rc)"
+}
+
+bootk() {     # the kernel the last reboot_now expected is the one booted; no record is nothing
+  [ -f "$S/expect-kernel" ] || return 0
+  local o e; o="$(q uname -r)"; e="$(cat "$S/expect-kernel")"
+  chk booted-kernel "$(b [ "$o" = "$e" ])" "booted $o, expected $e after the last reboot - check the boot entry, then rerun"
+}
+pinchk() {    # any pin STOPs: a pin keeps PVE 8's kernel after the upgrade (so newk and the kept set never see one past here)
+  local o k; o="$(q proxmox-boot-tool kernel list)" && grep -qE '^(Manually|Automatically) selected kernels:' <<<"$o" ||
+    { chk kernel-pin 0 "cannot read the kernel list: ${o%%$'\n'*}"; return; }   # never fail open
+  k="$(printf '%s\n' "$o" | awk '/^(Pinned kernel|Kernel pinned on next-boot):/{getline; print $1; exit}')"
+  chk kernel-pin "$(b [ -z "$k" ])" "$k pinned - \`proxmox-boot-tool kernel unpin\` first (a pin keeps PVE 8's kernel after the upgrade)"
+}
+guards() {    # at the start of every --apply, before the due phase $PH runs
+  local hn; hn="$(q hostname -s)"
+  chk hostname "$(b [ "$hn" = "$NAME" ])" "this host is '$hn', the profile is '$NAME'"
+  if [ -n "$GPUARG" ] || [ -f "$GPUF" ]; then gpu_decide
+  elif [ "$NVIDIA" = yes ] && [[ "$PH" =~ ^(reboot|recheck)$ ]]; then
+    stop "gpu decision" "none recorded for a GPU profile - rerun with --gpu yes|no"
+  else gpu_decide; fi
+}  # `running` is checked before every phase that changes the host - the main loop
+
+# --- apt sources: both formats, .list lines and .sources stanzas; every helper below reads /etc/apt only (fetch writes none)
+src_ents() {  # src_ents [file...]: "file<TAB>URI<TAB>suites" for every ENABLED entry (a .list line, a .sources stanza); no args = the live apt files
+  local f; [ $# -gt 0 ] || set -- "$R/etc/apt/sources.list" "$R"/etc/apt/sources.list.d/*.list "$R"/etc/apt/sources.list.d/*.sources
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      *.sources) awk -v F="$f" 'function dis(v) { v = tolower(v); return v == "no" || v == "false" || v == "off" || v == "disable" || v == "disabled" }
+        function fl() { if (u != "" && !dis(en)) print F "\t" u "\t" s; u = ""; s = ""; en = "" }
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { fl(); next }
+        tolower($1) == "uris:" { u = $2 }
+        tolower($1) == "suites:" { $1 = ""; s = $0; sub(/^ /, "", s) }
+        tolower($1) == "enabled:" { en = $2 }
+        END { fl() }' "$f";;
+      *) awk -v F="$f" '/^[[:space:]]*deb(-src)?[[:space:]]/ { l = $0; sub(/\[[^]]*\]/, "", l); split(l, a, " "); print F "\t" a[2] "\t" a[3] }' "$f";;
+    esac
+  done; }
+repo_kind() { case "$1" in
+  *//deb.debian.org/*|*//ftp.debian.org/*|*//security.debian.org/*|*//deb.debian.org|*//ftp.debian.org|*//security.debian.org) echo debian;;
+  *//enterprise.proxmox.com/*|*//enterprise.proxmox.com) echo enterprise;;
+  *//download.proxmox.com/*|*//download.proxmox.com) echo proxmox;;
+  *) echo third;; esac; }
+third_bw() {  # third-party entries naming bookworm
+  local f u s; while IFS=$'\t' read -r f u s; do [ "$(repo_kind "$u")" = third ] && [[ "$s" == *bookworm* ]] && printf '%s\t%s\t%s\n' "$f" "$u" "$s"; done < <(src_ents); }
+resc() { printf '%s' "$1" | sed 's/[][\\.*^$#\/|(){}+?]/\\&/g'; }
+stz_edit() {  # stz_edit <file> <URI> disable|switch|get: that .sources stanza only (the rest copied unchanged); get prints just it, switched
+  local t rc; t="$(mktemp "$S/stz.XXXXXX")" || return 1   # the state dir: same root filesystem as /etc/apt, never in it
+  awk -v U="$2" -v M="$3" '
+    function dis(v) { v = tolower(v); return v == "no" || v == "false" || v == "off" || v == "disable" || v == "disabled" }
+    function flush(  i, h) {
+      h = (hu && !dis(en))
+      if (n > 0 && (h || M != "get")) {
+        if (h) {
+          for (i = 1; i <= n; i++) {
+            if (M != "disable" && tolower(L[i]) ~ /^suites:/) gsub(/bookworm/, "trixie", L[i])
+            if (M == "disable" && tolower(L[i]) ~ /^enabled:/) { L[i] = "Enabled: no"; sn = 1 }
+          }
+          if (M == "disable" && !sn) L[++n] = "Enabled: no"
+        }
+        for (i = 1; i <= n; i++) print L[i]
+        if (M == "get") print ""
+      }
+      n = 0; hu = 0; en = ""; sn = 0
+    }
+    /^[[:space:]]*$/ { flush(); if (M != "get") print; next }
+    { L[++n] = $0
+      if (tolower($1) == "uris:") for (i = 2; i <= NF; i++) if ($i == U) hu = 1
+      if (tolower($1) == "enabled:") en = $2 }
+    END { flush() }' "$1" > "$t"; rc=$?
+  [ "$rc" = 0 ] && chmod --reference="$1" -- "$t" && sync && mv -f -- "$t" "$1"; rc=$?; rm -f -- "$t"; return $rc; }
+ent_edit() {  # ent_edit <file> <URI> disable|switch: one .list line or .sources stanza, through act
+  local f="$1" u="$2" m="$3" e; e="$(resc "$u")"
+  case "$f" in
+    *.sources) act stz_edit "$f" "$u" "$m";;
+    *) if [ "$m" = switch ]; then act sed -i -E "/^[[:space:]]*deb.*(^|[[:space:]])$e([[:space:]]|\$)/ s/bookworm/trixie/g" "$f"
+       else act sed -i -E "s/^([[:space:]]*deb.*[[:space:]]$e([[:space:]].*|\$))/# pve-upgrade: \1/" "$f"; fi;;
+  esac || stop sources "editing $f ($m $u) failed"; }
+ent_text() {  # the entry as the probe's temp dir holds it: bookworm -> trixie, the same Signed-By
+  case "$1" in *.sources) stz_get "$1" "$2";; *) sed -nE "/^[[:space:]]*deb.*[[:space:]]$(resc "$2")([[:space:]]|\$)/ s/bookworm/trixie/gp" "$1";; esac; }
+stz_get() { local t rc; t="$(mktemp "${TMPDIR:-/tmp}/pve-upgrade-stz.XXXXXX")" || return 1; cp -- "$1" "$t" && stz_edit "$t" "$2" get; rc=$?; [ "$rc" = 0 ] && cat "$t"; rm -f -- "$t" "$t.tmp"; return $rc; }
+pkg_owner() { local o; o="$(q dpkg -S "${1#"$R"}")" && say "${o%%:*} owns ${1#"$R"}: its next upgrade may write bookworm back - install its Debian 13 build"; return 0; }
+ceph_decide() {  # CEPHREL: the release of an enabled download.proxmox.com/debian/ceph-<rel> source; none but Ceph running here = squid; else empty
+  CEPHREL="$(src_ents | awk -F'\t' '$2 ~ /download\.proxmox\.com\/debian\/ceph-/ { sub(/.*ceph-/, "", $2); sub(/[^a-z].*/, "", $2); print $2; exit }')"
+  [ -n "$CEPHREL" ] || CEPHREL="$(src_ents "$S"/apt-before/* 2>/dev/null | awk -F'\t' '$2 ~ /download\.proxmox\.com\/debian\/ceph-/ { sub(/.*ceph-/, "", $2); sub(/[^a-z].*/, "", $2); print $2; exit }')"   # a rerun after the sed, before ceph.sources was written
+  if [ -z "$CEPHREL" ]; then ceph_found && CEPHREL=squid
+  elif [ "$CEPHREL" != squid ]; then chk ceph-repo 0 "Ceph $CEPHREL: Proxmox 9 needs squid - upgrade Ceph first"; return; fi
+  [ -z "$CEPHREL" ] || say "ceph $CEPHREL: upgrade writes ceph.sources (trixie, no-subscription)"; }
+repos_pre() {  # precheck: SUBSCRIPTION, Ceph, the third-party list, an older run's .bak
+  local f u s
+  chk subscription "$(b [ "${SUBSCRIPTION:-no}" != yes ])" "subscription hosts are not supported"
+  ceph_decide
+  while IFS=$'\t' read -r f u s; do
+    [ "$(repo_kind "$u")" = third ] || continue
+    say "third-party repo: ${f#"$R"} $u $s"; pkg_owner "$f"; done < <(src_ents)
+  for f in "$R"/etc/apt/sources.list.d/*.pve-upgrade.bak; do
+    [ -e "$f" ] && say "an older run's backup in sources.list.d (apt ignores it with a notice each update; never removed): ${f#"$R"}"; done
+  return 0
+}
+repos_fetch() {  # before the window: each third-party bookworm entry probed alone on trixie in its own temp dir; the plan is recorded
+  local f u s t o out rc plan lines=""
+  while IFS=$'\t' read -r f u s; do
+    if [ "$APPLY" = 0 ]; then echo "  would: probe ${f#"$R"} $u (bookworm -> trixie, its own temp dir, apt-get update); plan switch or disable -> $S/repos"; continue; fi
+    t="$(mktemp -d "${TMPDIR:-/tmp}/pve-upgrade-probe.XXXXXX")" || stop fetch-tmp "mktemp failed"
+    mkdir -p "$t/lists/partial" || stop fetch-tmp "cannot create $t/lists"
+    ent_text "$f" "$u" > "$t/probe.${f##*.}" || { rm -rf -- "$t"; stop fetch-tmp "cannot write the probe for $f"; }
+    o=(-o Dir::Etc::sourcelist=/dev/null -o "Dir::Etc::sourceparts=$t" -o "Dir::State::Lists=$t/lists" -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=)
+    out="$("${APT[@]}" "${o[@]}" update 2>&1 < /dev/null)"; rc=$?; logl "probe rc=$rc ${f#"$R"} $u: $(head -c 300 <<<"$out" | tr '\n' ' ')"
+    rm -rf -- "$t"
+    if [ "$rc" = 0 ] && ! grep -qE '^(Err:|E:)' <<<"$out"; then plan=switch; else plan=disable; fi
+    say "repo plan: ${f#"$R"} $u -> $plan"; lines+="${f#"$R"}"$'\t'"$u"$'\t'"$plan"$'\n'
+  done < <(third_bw)
+  [ "$APPLY" = 0 ] || wr "$S/repos" "${lines%$'\n'}"
+}
+repos_plan() {  # upgrade, before anything changes: every third-party bookworm entry has a recorded plan
+  local f u s
+  [ "${SUBSCRIPTION:-no}" != yes ] || stop subscription "subscription hosts are not supported"
+  while IFS=$'\t' read -r f u s; do
+    if [ "$APPLY" = 0 ]; then echo "  would: apply the plan fetch recorded in $S/repos for ${f#"$R"} $u (none -> STOP upgrade: repos)"; continue; fi
+    [ -f "$S/repos" ] || stop repos "no plan recorded for ${f#"$R"} $u - run: pve-upgrade $NAME fetch --apply (re-probes only, the state does not move)"
+    awk -F'\t' -v k="${f#"$R"}" -v u="$u" '$1 == k && $2 == u { f = 1 } END { exit !f }' "$S/repos" || stop repos "no plan for ${f#"$R"} $u - run: pve-upgrade $NAME fetch --apply (re-probes only, the state does not move)"
+  done < <(third_bw)
+}
+repos_apply() {  # upgrade: the plan on third-party entries; bookworm .sources of Debian/Proxmox disabled (their .list lines: the sed)
+  local f u s p k
+  while IFS=$'\t' read -r f u s; do
+    pkg_owner "$f"
+    if [ "$APPLY" = 0 ]; then p="switch or disable"; else p="$(awk -F'\t' -v k="${f#"$R"}" -v u="$u" '$1 == k && $2 == u { print $3 }' "$S/repos")"; fi
+    case "$p" in switch|disable) ent_edit "$f" "$u" "$p"; say "repo ${p}d: ${f#"$R"} $u";; *) [ "$APPLY" = 0 ] && echo "  would: switch (bookworm -> trixie) or disable ${f#"$R"} $u, as fetch's plan says";; esac
+  done < <(third_bw)
+  while IFS=$'\t' read -r f u s; do
+    [ "$(repo_kind "$u")" != third ] && [[ "$f" == *.sources && "$s" == *bookworm* ]] && { ent_edit "$f" "$u" disable; say "bookworm source disabled: ${f#"$R"} $u"; }
+  done < <(src_ents)
+}
+ent_off() {   # every enabled source on enterprise.proxmox.com, either format (the proxmox-ve 9 package installs one)
+  local f u s said=" "
+  while IFS=$'\t' read -r f u s; do
+    [ "$(repo_kind "$u")" = enterprise ] || continue
+    ent_edit "$f" "$u" disable
+    case "$said" in *" $f "*) ;; *) say "enterprise source disabled: ${f#"$R"}"; said+="$f ";; esac
+  done < <(src_ents)
+}
+apt_back() {  # copy once into the state dir, never overwrite, nothing beside the sources
+  local f; act mkdir -p "$S/apt-before" || stop sources "cannot create $S/apt-before"
+  for f in "$R/etc/apt/sources.list" "$R"/etc/apt/sources.list.d/*.list "$R"/etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    [ -e "$S/apt-before/${f##*/}" ] || act cp -a "$f" "$S/apt-before/${f##*/}" || stop sources "cannot back up $f"
+  done; }
+repos_re() {  # recheck: appends to bad[]
+  local o f u s c
+  o="$(q apt-get update)" || bad+=("apt-get update failed: $(grep -m1 -E '^E:' <<<"$o")")
+  grep -qE '^(Err:|W:|E:|Warning:|Error:)' <<<"$o" && bad+=("apt-get update: $(grep -m1 -E '^(Err:|W:|E:|Warning:|Error:)' <<<"$o")")
+  grep -qi 'Ignoring file' <<<"$o" && bad+=("apt-get update: $(grep -m1 -i 'Ignoring file' <<<"$o")")
+  c="$(q apt-cache policy proxmox-ve | awk '/^ *Candidate:/ { c = $2 } /^[ *]+[0-9][^ ]* +[0-9]+$/ { v = ($1 == "***" ? $2 : $1); on = (v == c); next } on && /^ +[0-9]+ / { print }' )"
+  grep -qE 'download\.proxmox\.com.* trixie/pve-no-subscription' <<<"$c" || bad+=("apt-cache policy proxmox-ve: candidate not from download.proxmox.com trixie/pve-no-subscription")
+  while IFS=$'\t' read -r f u s; do
+    [[ "$s" != *bookworm* ]] || bad+=("enabled source names bookworm: ${f#"$R"} $u")
+    [ "$(repo_kind "$u")" != enterprise ] || bad+=("enabled source on enterprise.proxmox.com: ${f#"$R"}")
+  done < <(src_ents)
+}
+
+ph_precheck() {
+  if [ "$APPLY" = 1 ]; then rm -f "$S/failed-units" || stop write "cannot remove a stale $S/failed-units"; fi   # an earlier run's record is never the baseline
+  q pveversion -v > /dev/null; q uname -r > /dev/null; q dkms status > /dev/null
+  bootk; pinchk
+  local nm; nm="$(nic_missing | tr '\n' ' ')"
+  chk nic-device "$(b [ -z "$nm" ])" "names a NIC with no device: $nm- comment its stanzas out of /etc/network/interfaces"
+  nm="$(port_missing | tr '\n' ' ')"; [ -z "$nm" ] || say "bridge-ports/bond-slaves name a NIC with no device: $nm"
+  repos_pre
+  local hn; hn="$(q hostname -s)"
+  chk hostname "$(b [ "$hn" = "$NAME" ])" "this host is '$hn', the profile is '$NAME'"
+  chk quorate "$(b quorate)" "pvecm status is not quorate"
+  bk_pre
+  say "free on /: $(freeg) GB (the 10 GB gate is measured after preclean)"
+  FU="$(q systemctl --failed --no-legend --plain)" || stop failed-units "systemctl --failed unreadable"
+  FU="$(awk '{print ($1 == "●" ? $2 : $1)}' <<<"$FU" | tr '\n' ' ')"; FU="${FU% }"   # written after the state: none = recheck strict
+  say "failed units before (recheck ignores these): ${FU:-none}"
+  [ -z "$ZFS_POOL" ] || zfs_pre
+  if command -v pve8to9 > /dev/null; then local ok=0; p89_ok sdb && ok=1; chk pve8to9 "$ok" "pve8to9 --full: $P89"
+  else say "pve8to9: not installed yet (pve-manager < 8.4.1) - checked after to-8.4"; fi
+  if [ "${GPU:-}" = yes ]; then chk sha256 "$(b sha_ok)" "$NV_PATH missing or its sha256 is not driver.conf's"; fi
+  if grep -q '^vendor_id[[:space:]]*:[[:space:]]*GenuineIntel' "$R/proc/cpuinfo" 2>/dev/null; then
+    local mc; mc="$(q dpkg-query -W -f='${Status}' intel-microcode)"
+    chk intel-microcode "$(b [ "$mc" = "install ok installed" ])" "not installed (pve8to9 FAILs on it after the upgrade - apt-get install intel-microcode first)"
+    rec intel-microcode "$mc"
+  fi
+  chk etc-backup "$(b [ ! -e "$BAK" ])" "$BAK exists - it is the pre-upgrade copy, never overwritten"
+  [ -z "$SHARED" ] && say "nfs: skipped: no SHARED" || nfs_pre
+  backup_etc
+}
+backup_etc() {  # to .part, the final name only on success; rc 1 with nothing but "file changed" (pmxcfs) is success
+  [ "$APPLY" = 1 ] || { echo "  would: tar -czf ${BAK#"$R"}.part -C / etc, then mv to ${BAK##*/}"; return 0; }
+  local err="$S/tar.err" rc; rm -f "$BAK.part"
+  echo "$(ts) run: tar -czf $BAK.part -C $R/ etc" >> "$LOG"
+  tar -czf "$BAK.part" -C "$R/" etc < /dev/null 2> "$err"; rc=$?; cat "$err" >> "$LOG"; echo "$(ts) rc=$rc: tar" >> "$LOG"
+  if [ "$rc" = 0 ] || { [ "$rc" = 1 ] && ! grep -qv 'file changed as we read it' "$err"; }; then mv "$BAK.part" "$BAK" && return 0; fi
+  rm -f "$BAK.part"; stop etc-backup "tar of /etc rc=$rc: $(grep -v 'file changed as we read it' "$err" | head -1)"
+}
+freeg() { q df -BG --output=avail "$R/" | tail -1 | tr -dc 0-9; }
+rec() { [ "$APPLY" = 1 ] && printf '%s\n' "$2" > "$S/$1"; return 0; }   # rec <file> <text>: a record in the state dir
+arcmax() { sed -nE 's/.*zfs_arc_max=([0-9]+).*/\1/p' "$R/etc/modprobe.d/zfs.conf" 2>/dev/null | tail -1; }
+cmax() { awk '$1=="c_max"{print $3}' "$R/proc/spl/kstat/zfs/arcstats" 2>/dev/null; }
+esps() { q proxmox-boot-tool status | grep -c 'is configured with'; }
+zfs_cache() { local o; o="$(q zpool get -H -o value cachefile "$1")"   # precheck and the reboot gate: the cache the next boot imports from
+  chk zfs-cachefile "$(b [ "$o" != none ] && [ -s "$R/etc/zfs/zpool.cache" ])" "cachefile '$o', /etc/zfs/zpool.cache empty or missing"; }
+zfs_pre() {   # the pool healthy and idle; what recheck compares against recorded. Never `zpool upgrade`.
+  local p="$ZFS_POOL" o; o="$(q zpool status -x "$p")"
+  chk zfs-health "$(b grep -q 'is healthy' <<<"$o")" "zpool status -x $p: ${o%%$'\n'*}"
+  o="$(q zpool status "$p")"
+  chk zfs-scrub "$(grep -qE '(scrub|resilver) in progress' <<<"$o" && echo 0 || echo 1)" "a scrub or resilver runs on $p - wait for it"
+  rec zfs-status "$(q zpool status -P "$p")"; rec zfs-get "$(q zpool get all "$p")"
+  rec zfs-zvols "$(q zfs list -H -o name -t volume -r "$p")"
+  zfs_cache "$p"
+  rec zfs-arcmax "$(arcmax)"; rec zfs-cmax "$(cmax)"; say "zfs: zfs_arc_max '$(arcmax)', c_max '$(cmax)'"
+  o="$(q findmnt -n -o FSTYPE /)"; rec rootfs "$o"
+  if [ "$o" = zfs ]; then rec boot-tool-before "$(q proxmox-boot-tool status)"
+    chk esp "$(b [ "$(esps)" -gt 0 ])" "root on ZFS and proxmox-boot-tool status lists no ESP"; fi
+}
+zfs_re() {    # recheck: appends to bad[]
+  local p="$ZFS_POOL" o
+  o="$(q zpool status -x "$p")"; grep -q 'is healthy' <<<"$o" || bad+=("zpool $p: ${o%%$'\n'*}")
+  [ "$(q zpool list -H -o health "$p")" = ONLINE ] || bad+=("zpool $p not ONLINE")
+  local ic=0; for o in zfs-import-cache zfs-import-scan; do q systemctl is-active "$o" > /dev/null && ic=1; done   # trixie may import by scan (cachefile none, empty cache)
+  [ "$ic" = 1 ] || bad+=("neither zfs-import-cache nor zfs-import-scan active")
+  for o in zfs-mount zfs-zed; do q systemctl is-active "$o" > /dev/null || bad+=("$o not active"); done
+  o="$(q zpool get -H -o value cachefile "$p")"   # the cache the next boot imports from: set again when the reboot lost it
+  if [ "$o" = none ] || [ ! -s "$R/etc/zfs/zpool.cache" ]; then
+    if [ "$APPLY" = 1 ]; then say "zfs: cachefile '$o', zpool.cache empty - setting it"
+      act zpool set cachefile=/etc/zfs/zpool.cache "$p" || bad+=("zpool set cachefile failed")
+      [ -s "$R/etc/zfs/zpool.cache" ] || bad+=("zpool.cache still empty after zpool set cachefile")
+    else echo "  would: zpool set cachefile=/etc/zfs/zpool.cache $p (cachefile '$o', zpool.cache empty or missing)"; fi
+  fi
+  [ -f "$S/zfs-zvols" ] && [ "$(q zfs list -H -o name -t volume -r "$p")" = "$(cat "$S/zfs-zvols")" ] || bad+=("zvol list differs from precheck's record")
+  [ "$(arcmax)" = "$(cat "$S/zfs-arcmax" 2>/dev/null)" ] || bad+=("zfs_arc_max '$(arcmax)', recorded '$(cat "$S/zfs-arcmax" 2>/dev/null)'")
+  [ "$(cmax)" = "$(cat "$S/zfs-cmax" 2>/dev/null)" ] || bad+=("arcstats c_max '$(cmax)', recorded '$(cat "$S/zfs-cmax" 2>/dev/null)'")
+  if [ "$(cat "$S/rootfs" 2>/dev/null)" = zfs ]; then rec boot-tool-after "$(q proxmox-boot-tool status)"
+    [ "$(esps)" -gt 0 ] || bad+=("root on ZFS: proxmox-boot-tool lists no ESP"); fi
+}
+kver() { sed -nE 's/^(proxmox|pve)-(kernel|headers)-//p; s/^linux-(image|headers)-//p' <<<"$1" | sed 's/-signed$//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-'; }
+ph_preclean() {   # frees / before the 10 GB gate: old kernels through apt only; lists, never removes, backups/ISOs/templates
+  local before run newest pin keep k pk purge=() d n ds f
+  before="$(freeg)"; say "free on / before preclean: ${before:-?} GB"
+  run="$(q uname -r)"; [ -n "$run" ] || stop kernels "uname -r is empty - no kept set"; newest="$(ls "$R/boot" | sed -n 's/^vmlinuz-//p' | sort -V | tail -1)"
+  pin="$(q proxmox-boot-tool kernel list | awk '/^Pinned kernel:/{getline; print $1}')"
+  keep=" $run $newest $pin "; say "kernels kept: $keep"
+  local kl half sim extra all arc v rc
+  # q folds stderr in: drop dpkg-query's own "no packages found matching ..." lines, never read as a package in state "no"
+  kl="$(q dpkg-query -W -f '${Package} ${db:Status-Abbrev}\n' 'proxmox-kernel-*' 'pve-kernel-*' 'proxmox-headers-*' \
+      'pve-headers-*' 'linux-image-*' 'linux-headers-*' | grep -v '^dpkg-query:')"
+  half="$(awk 'NF && $2 !~ /^(ii|.n|rc)/{printf "%s(%s) ", $1, $2}' <<<"$kl")"   # hi iF iU ...: never rm their dirs (rc = removed, config left: not half) - by hand first
+  chk kernel-state "$(b [ -z "$half" ])" "kernel package(s) in a half state: $half- settle with dpkg/apt by hand, then rerun"
+  for pk in $(awk '$2 ~ /^ii/{print $1}' <<<"$kl"); do
+    k="$(kver "$pk")"; [ -n "$k" ] && [[ "$keep" != *" $k "* ]] && purge+=("$pk"); done
+  # a meta (pve|proxmox)-(headers|kernel)-<series> goes too when EVERY dependency is already purged - a kept kernel's meta stays
+  local m dep left
+  for m in $(awk '$2 ~ /^ii/{print $1}' <<<"$kl" | grep -E '^(pve|proxmox)-(headers|kernel)-[0-9]+\.[0-9]+$'); do
+    # one Depends group per line; a group `X-signed | X` counts as purged when either alternative is
+    dep="$(q dpkg-query -W -f '${Depends}' "$m")"; dep="$(tr ',' '\n' <<<"$dep" | sed -E 's/\([^)]*\)//g; s/[[:space:]]//g' | grep -v '^$')"
+    left="$(awk -v p=" ${purge[*]} " '{n = split($0, a, "|"); for (i = 1; i <= n; i++) if (index(p, " " a[i] " ")) next; print}' <<<"$dep")"
+    [ -n "$dep" ] && [ -z "$left" ] && purge+=("$m"); done
+  if [ "${#purge[@]}" -gt 0 ]; then
+    sim="$(q env DEBIAN_FRONTEND=noninteractive apt-get -s purge "${purge[@]}")" || stop kernel-purge-sim "apt-get -s purge failed"
+    extra="$(sed -nE 's/^(Remv|Purg) ([^ ]+).*/\2/p' <<<"$sim" | grep -vxF -f <(printf '%s\n' "${purge[@]}") | tr '\n' ' ')"
+    chk kernel-purge-sim "$(b [ -z "$extra" ])" "apt-get -s purge would also remove: $extra- decide by hand"
+    act "${APT[@]}" purge "${purge[@]}" || stop kernel-purge "apt-get purge of old kernels failed (log)"
+    act proxmox-boot-tool refresh || stop boot-refresh "proxmox-boot-tool refresh failed (log)"
+  else say "no old kernel packages"; fi
+  all="$(q dpkg-query -W -f '${Package} ${Status}\n')"; arc=$?
+  ds="$(q dkms status)"
+  for d in "$R"/usr/lib/modules/* "$R"/usr/src/*; do [ -d "$d" ] || continue
+    n="${d##*/}"; f="${d#"$R"}"
+    for k in $keep; do [[ "$n" == *"$k"* ]] && continue 2; done
+    # owned = a package in ANY state names its version (dpkg -S misses merged-/usr paths); any query error = owned
+    [ "$arc" = 0 ] || { say "kept (dpkg-query rc $arc): $f"; continue; }
+    v="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z]+' <<<"$n" | head -1)"; v="${v:-$n}"
+    awk '{print $1}' <<<"$all" | grep -F -- "$v" > /dev/null && { say "kept (a package names $v): $f"; continue; }
+    q dpkg -S "$f" > /dev/null; rc=$?; [ "$rc" = 1 ] || continue
+    grep -qF -e "$n" -e "${n/-//}" <<<"$ds" && continue
+    say "unowned: $f ($(du -sh "$d" 2>/dev/null | cut -f1))"; act rm -rf -- "$d"
+  done
+  act "${APT[@]}" clean
+  say "autoremove would purge: $(q apt-get -s autoremove --purge | sed -n 's/^Purg \([^ ]*\).*/\1/p' | tr '\n' ' ')"
+  act "${APT[@]}" autoremove --purge || stop autoremove "apt-get autoremove failed (log)"
+  act journalctl --vacuum-size=200M
+  act find "$R/var/log" -type f "(" -name "*.gz" -o -name "*.[0-9]" ")" -delete
+  while IFS= read -r f; do [ -n "$f" ] || continue
+    if q fuser -s "$f"; then say "kept (open): ${f#"$R"}"; else act rm -f -- "$f"; fi
+  done < <(find "$R/tmp" -xdev -type f -mtime +7 2>/dev/null)
+  for d in "$R/var/crash" "$R/var/lib/systemd/coredump"; do [ -d "$d" ] && act find "$d" -type f -delete; done
+  for d in "$R/var/lib/vz/dump" "$R/var/lib/vz/template/iso" "$R/var/lib/vz/template/cache" "$R"/mnt/pve/*; do
+    timeout 10 test -d "$d"; rc=$?   # a hard NFS mount hangs while its server is down: never wait on it
+    [ "$rc" = 124 ] && { say "not listed (mount not answering): ${d#"$R"}"; continue; }; [ "$rc" = 0 ] || continue
+    f="$(timeout 10 ls -- "$d")" || { say "not listed (mount not answering): ${d#"$R"}"; continue; }
+    say "listed, never removed: ${d#"$R"}: $(head -20 <<<"$f" | tr '\n' ' ')"; done
+  local after; after="$(freeg)"; say "free on / after preclean: ${after:-?} GB (before ${before:-?})"
+  chk free-root "$(b [ "${after:-0}" -ge 10 ])" "${after:-?} GB free on / after preclean, need >= 10"
+}
+trixie_src() {  # trixie_src debian|proxmox|ceph <rel>: the text of the .sources file upgrade writes - fetch pre-fetches with the same text
+  case "$1" in
+    debian) printf 'Types: deb deb-src\nURIs: http://deb.debian.org/debian/\nSuites: trixie trixie-updates\nComponents: main contrib non-free-firmware\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n\nTypes: deb deb-src\nURIs: http://security.debian.org/debian-security/\nSuites: trixie-security\nComponents: main contrib non-free-firmware\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n';;
+    proxmox) printf 'Types: deb\nURIs: http://download.proxmox.com/debian/pve\nSuites: trixie\nComponents: pve-no-subscription\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n';;
+    ceph) printf 'Types: deb\nURIs: http://download.proxmox.com/debian/ceph-%s\nSuites: trixie\nComponents: no-subscription\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n' "$2";;
+  esac; }
+trixie_tmp() {  # a temp dir with upgrade's trixie .sources: sets TT (the dir) and TO (apt options reading only it); the caller removes TT
+  local n; TT="$(mktemp -d "${TMPDIR:-/tmp}/pve-upgrade-fetch.XXXXXX")" || stop fetch-tmp "mktemp failed"
+  mkdir -p "$TT/lists/partial" || stop fetch-tmp "cannot create $TT/lists"
+  for n in debian proxmox; do trixie_src "$n" > "$TT/$n.sources" || stop fetch-tmp "cannot write $TT/$n.sources"; done
+  [ -z "$CEPHREL" ] || trixie_src ceph "$CEPHREL" > "$TT/ceph.sources" || stop fetch-tmp "cannot write $TT/ceph.sources"
+  TO=(-o Dir::Etc::sourcelist=/dev/null -o "Dir::Etc::sourceparts=$TT" -o "Dir::State::Lists=$TT/lists"
+      -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=)   # no pkgcache.bin rebuilt; the archives dir stays upgrade's
+}
+remv_list() {  # stdin: apt-get -s output; prints each Remv that is not a t64 rename (an Inst whose name minus t64 is the Remv: libssl3 -> libssl3t64), one per line
+  awk '$1=="Inst"{i[$2]=1} ($1=="Remv"||$1=="Purg"){r[$2]=1} END{for(n in r){ ren=0; for(m in i){ t=m; sub(/t64/,"",t); if(t==n) ren=1 } if(!ren) print n }}' | sort -u; }
+removals_guard() {  # upgrade, before anything changes: the trixie simulation again; a Remv outside REMOVE_OK STOPs
+  local t sim bad="" n; [ "$APPLY" = 1 ] || { echo "  would: apt-get -s dist-upgrade on trixie (temp sources), STOP on a Remv that is not a t64 rename nor in REMOVE_OK (${REMOVE_OK:-none}); fetch recorded: $(tr '\n' ' ' < "$S/removals" 2>/dev/null)"; return 0; }
+  trixie_tmp; t="$TT"; local f u e i=0 k plan src   # the real dist-upgrade also reads the switched third-party entries (repos_apply runs first) and every unplanned one
+  while IFS=$'\t' read -r k u plan; do   # switch rows of the plan: the text from the backup (a rerun: the live entry is trixie already), else the live file
+    [ "$plan" = switch ] || continue
+    f="$R$k"; src="$S/apt-before/${k##*/}"; [ -f "$src" ] || src="$f"
+    i=$((i+1)); ent_text "$src" "$u" > "$t/sw$i.${f##*.}" || { rm -rf -- "$t"; stop fetch-tmp "cannot write the switched entry $f"; }
+  done < <(cat "$S/repos" 2>/dev/null)
+  while IFS=$'\t' read -r f u e; do   # enabled third-party entries without a plan row (no bookworm in them): read as they are
+    [ "$(repo_kind "$u")" = third ] || continue
+    [ -z "$(awk -F'\t' -v k="${f#"$R"}" -v u="$u" '$1 == k && $2 == u { print $3 }' "$S/repos" 2>/dev/null)" ] || continue
+    i=$((i+1)); case "$f" in
+      *.sources) stz_get "$f" "$u";;
+      *) sed -nE "/^[[:space:]]*deb.*[[:space:]]$(resc "$u")([[:space:]]|\$)/p" "$f";; esac > "$t/ot$i.${f##*.}" || { rm -rf -- "$t"; stop fetch-tmp "cannot write the entry $f"; }
+  done < <(src_ents)
+  act "${APT[@]}" "${TO[@]}" update || { rm -rf -- "$t"; stop apt-update "apt-get update on trixie (temp sources) failed (log)"; }
+  sim="$(q "${APT[@]}" "${TO[@]}" -s dist-upgrade)" || { rm -rf -- "$t"; stop apt-sim "apt-get -s dist-upgrade to trixie failed (log)"; }
+  rm -rf -- "$t"
+  for n in $(remv_list <<<"$sim"); do case " $REMOVE_OK " in *" $n "*) say "removal accepted (REMOVE_OK): $n";; *) bad+="$n ";; esac; done
+  [ -z "$bad" ] || stop removals "${bad}- name them in the profile's REMOVE_OK to accept"
+}
+archm() { du -sm --apparent-size "$R/var/cache/apt/archives" 2>/dev/null | cut -f1; }   # MB of fetched .debs
+ph_fetch() {  # download only, before the window (guests may run): /var/cache/apt and a temp dir, never /etc/apt; the bookworm
+  local t n after a1  # update refreshes the live lists (as pve-daily-update does) - only the trixie half is isolated
+  if [ "$REPROBE" = 1 ]; then echo "  would: re-probe and re-record $S/repos only (fetch is past; the state does not move)"; repos_fetch; return; fi
+  ceph_decide; repos_fetch
+  act "${APT[@]}" update || stop apt-update "apt-get update failed (log)"
+  act "${APT[@]}" -d dist-upgrade || stop apt-fetch "apt-get -d dist-upgrade on bookworm failed (log)"
+  if [ ! -f "$R/usr/share/keyrings/proxmox-archive-keyring.gpg" ]; then say "trixie pre-fetch skipped: keyring missing"
+  elif [ "$APPLY" = 0 ]; then echo "  would: apt-get update + -d dist-upgrade with only upgrade's trixie .sources (a temp dir)"
+    echo "  would: apt-get -s dist-upgrade there; record and say every Remv that is not a t64 rename (\$S/removals)"
+    [ -z "$CEPHREL" ] || echo "  would: also pre-fetch ceph.sources trixie ($CEPHREL)"
+    [ "${GPU:-}" != yes ] || echo "  would: -d install proxmox-default-headers (same options; driver installs it)"
+  else
+    trixie_tmp; t="$TT"; local o=("${TO[@]}")
+    act "${APT[@]}" "${o[@]}" update || { rm -rf -- "$t"; stop apt-update "apt-get update on trixie (temp sources) failed (log)"; }
+    act "${APT[@]}" "${o[@]}" -d dist-upgrade || { rm -rf -- "$t"; stop apt-fetch "apt-get -d dist-upgrade to trixie failed (log)"; }
+    local sim; sim="$(q "${APT[@]}" "${o[@]}" -s dist-upgrade)" || { rm -rf -- "$t"; stop apt-sim "apt-get -s dist-upgrade to trixie failed (log)"; }
+    sim="$(remv_list <<<"$sim")"; rec removals "$sim"
+    say "removals in the trixie dist-upgrade, not t64 renames: ${sim:-none}${sim:+ - REMOVE_OK in the profile accepts them at upgrade}"
+    if [ "${GPU:-}" = yes ]; then   # driver's `install proxmox-default-headers` is a download of its own
+      act "${APT[@]}" "${o[@]}" -d install proxmox-default-headers || { rm -rf -- "$t"; stop apt-fetch "apt-get -d install proxmox-default-headers (trixie) failed (log)"; }
+    fi
+    rm -rf -- "$t"
+  fi
+  a1="$(archm)"; say "fetched archive: ${a1:-?} MB"
+  after="$(freeg)"   # preclean emptied the archive, so all of it is fetch's (this run's or an earlier one's) - the space the 10 GB is for
+  chk free "$(b [ $(( ${after:-0} * 1024 + ${a1:-0} )) -ge 10240 ])" "${after:-?} GB on / after fetch + ${a1:-?} MB in the archive, need >= 10 GB"
+}
+ph_drain() { running; }
+recover() {   # a host reset mid-unpack boots half-upgraded, maybe with no network: finish dpkg from the fetched cache, offline
+  local a n u
+  a="$(q dpkg --audit)"; u="$(ls -A "$R/var/lib/dpkg/updates" 2>/dev/null)"
+  [ -n "$a" ] || [ -n "$u" ] || return 0
+  n="$(grep -c '^[[:space:]]' <<<"$a")"
+  if [ "$APPLY" = 0 ]; then echo "  would recover: dpkg --configure -a, then apt-get -f install --no-download (offline, $n package(s) in the audit)"; return 0; fi
+  act dpkg --configure -a || say "recover: dpkg --configure -a failed (log)"
+  act "${APT[@]}" -f install --no-download || say "recover: apt-get -f install --no-download failed (log)"
+  a="$(q dpkg --audit)"
+  [ -z "$a" ] || stop recover "recover: ${a%%$'\n'*}"
+  say "recovered: $n packages configured"
+}
+ph_to84() {
+  recover
+  act "${APT[@]}" update || stop apt-update "apt-get update failed (log)"
+  act "${APT[@]}" dist-upgrade || stop apt-dist-upgrade "apt-get dist-upgrade on bookworm failed (log)"
+  if later "pve-manager >= 8.4.1; pve8to9 --full passes; reboot if the kernel changed"; then
+    local v; v="$(q pveversion | sed -n 's|^pve-manager/\([^/]*\)/.*|\1|p')"
+    chk pve-manager "$(b [ "$(printf '%s\n8.4.1\n' "$v" | sort -V | head -1)" = 8.4.1 ])" "pve-manager $v < 8.4.1"
+    local ok=0; p89_ok sdb && ok=1; chk pve8to9 "$ok" "pve8to9 --full: $P89"
+    local nk; nk="$(newk)" || stop kernel-pin "cannot read the kernel list"
+    if [ "$nk" != "$(q uname -r)" ] && [ "${GPU:-}" = yes ]; then   # Debian's 535 module is not rebuilt by a kernel update
+      act "${APT[@]}" install "proxmox-headers-$nk" || stop headers "proxmox-headers-$nk failed (log)"
+      act dkms autoinstall -k "$nk" || stop dkms "dkms autoinstall -k $nk failed (log)"
+    fi
+    if [ "$nk" != "$(q uname -r)" ]; then say "kernel changed ($(q uname -r) -> $nk): reboot, then rerun \`all --apply\`"; [ "$APPLY" = 0 ] || echo "NEXT reboot now (kernel change): announce it - this run reboots next, ssh will drop"; reboot_now to-8.4; exit 0; fi
+  fi
+}
+sdboot() {    # the wiki's fix for pve8to9's systemd-boot FAIL: remove the META package, only on a host that boots GRUB
+  local sim rm st
+  # installed = any status but none/un/rc (a held hi too); dpkg's "no packages found" is none, any other error STOPs
+  st="$(q dpkg-query -W -f '${db:Status-Abbrev}' systemd-boot)" || grep -q '^dpkg-query: no packages found matching' <<<"$st" \
+    || stop systemd-boot "dpkg-query systemd-boot failed: ${st%%$'\n'*}"
+  case "$st" in ""|dpkg-query:*|?n*|?c*) say "systemd-boot: not installed"; return 0;; esac
+  chk systemd-boot "$(b [ ! -e "$R/etc/kernel/proxmox-boot-uuids" ])" "systemd-boot in use (/etc/kernel/proxmox-boot-uuids) - decide, then rerun"
+  chk systemd-boot "$(b [ -d "$R/boot/grub" ])" "no /boot/grub - not a GRUB host - decide, then rerun"
+  chk systemd-boot "$(b [ "$(esps)" = 0 ])" "proxmox-boot-tool status: an ESP is configured - systemd-boot in use - decide, then rerun"
+  sim="$(q apt-get -s remove systemd-boot)"; rm="$(sed -nE 's/^(Remv|Purg) ([^ ]+).*/\2/p' <<<"$sim" | tr '\n' ' ')"
+  chk systemd-boot-sim "$(b [ "$rm" = "systemd-boot " ])" "apt-get -s remove systemd-boot would remove: ${rm:-nothing}- decide by hand"
+  act "${APT[@]}" remove systemd-boot || stop systemd-boot "apt-get remove systemd-boot failed (log)"
+}
+ph_prepare() {
+  local d n mac pk dup
+  pinchk
+  dup="$(for d in "$R"/sys/class/net/*; do [ -e "$d/device" ] && cat "$d/address"; done | sort | uniq -d | tr '\n' ' ')"
+  chk nic-mac "$(b [ -z "$dup" ])" "MAC shared by two NICs (bond slaves?): $dup- pinning by MAC would pin the wrong port - decide, then rerun"
+  # pin every physical NIC to its CURRENT name by MAC: interfaces, post-up offloads, units and host.fw stay valid untouched
+  for d in "$R"/sys/class/net/*; do
+    [ -e "$d/device" ] || continue
+    n="${d##*/}"; mac="$(cat "$d/address")"
+    put "$LINKD/10-pve-upgrade-$n.link" "$(printf '[Match]\nMACAddress=%s\nType=ether\n\n[Link]\nName=%s\n' "$mac" "$n")"
+  done
+  act update-initramfs -u -k all || stop initramfs "update-initramfs failed (log)"
+  if later "every NIC name the config uses is pinned"; then local ok=0; nics_ok && ok=1; chk nic-pinning "$ok" "not pinned: $NICMISS"; fi
+  if grep -Eq '^[[:space:]]*[^#[:space:]]' "$R/etc/sysctl.conf" 2>/dev/null; then
+    act mv "$R/etc/sysctl.conf" "$R/etc/sysctl.d/99-pve-upgrade-from-sysctl-conf.conf"
+  else say "sysctl.conf: nothing to move"; fi
+  if [ -d "$R/sys/firmware/efi" ] && q findmnt -n -o SOURCE / | grep '^/dev/mapper/' > /dev/null; then
+    act "${APT[@]}" install grub-efi-amd64 || stop grub-efi "apt-get install grub-efi-amd64 failed"
+  else say "grub-efi-amd64: not needed (not UEFI + root on LVM)"; fi
+  sdboot
+  # Debian's bookworm nvidia-* must be gone BEFORE the trixie sources: its dkms must not build during the dist-upgrade.
+  # From here to the driver phase the host has no GPU driver - it is drained.
+  if [ "${GPU:-}" = yes ]; then
+    pk="$(nvpk)"; say "Debian nvidia packages to purge: ${pk:-none}"
+    if [ -n "$pk" ]; then act "${APT[@]}" purge $pk || stop purge "apt-get purge $pk failed"; fi
+  fi
+  # the strict gate, on every path (a rerun after the removal too): the upgrade starts only from FAILURES: 0
+  if later "pve8to9 --full: FAILURES: 0"; then local ok=0; p89_ok && ok=1; chk pve8to9 "$ok" "pve8to9 --full: $P89"; fi
+}
+ph_upgrade() {
+  local f
+  recover
+  ceph_decide; repos_plan
+  removals_guard
+  mark dist-upgrade
+  apt_back
+  repos_apply
+  for f in "$R/etc/apt/sources.list" "$R"/etc/apt/sources.list.d/*.list; do
+    [ -f "$f" ] || continue
+    act sed -i -E 's/^([^#].*(bookworm|enterprise\.proxmox\.com))/# pve-upgrade: \1/' "$f" || stop sources "sed on $f failed"
+  done
+  ent_off
+  local n; for n in debian proxmox; do put "$R/etc/apt/sources.list.d/$n.sources" "$(trixie_src "$n")"; done
+  [ -z "$CEPHREL" ] || put "$R/etc/apt/sources.list.d/ceph.sources" "$(trixie_src ceph "$CEPHREL")"
+  act "${APT[@]}" update || stop apt-update "apt-get update on trixie failed (log)"
+  act "${APT[@]}" dist-upgrade || stop apt-dist-upgrade "apt-get dist-upgrade to trixie failed (log)"
+  ent_off   # proxmox-ve 9 installs pve-enterprise.sources enabled: no subscription, every update would error
+  for f in "${MAINT_CONFFILES[@]}"; do   # the maintainer's version for the fixed list; local kept as .pre-pve9
+    if [ "$APPLY" = 0 ]; then echo "  would take maintainer $f if $f.dpkg-dist exists"
+    elif [ -f "$R$f.dpkg-dist" ]; then act cp -a "$R$f" "$R$f.pre-pve9"; act mv "$R$f.dpkg-dist" "$R$f"; fi
+  done
+}
+ph_driver() {
+  [ "${GPU:-}" = no ] && { say "driver phase: nothing to do (decision no)"; return 0; }
+  [ -n "${GPU:-}" ] || { echo "  would: stop before the driver phase (--gpu yes|no)"; return 0; }
+  chk sha256 "$(b sha_ok)" "$NV_PATH missing or its sha256 is not driver.conf's ($NV_SHA256)"
+  put "$R/etc/modprobe.d/pve-upgrade-blacklist.conf" "$(printf 'blacklist nova\nblacklist nova_core\nblacklist nouveau\n')"
+  act update-initramfs -u -k all || stop initramfs "update-initramfs failed (log)"
+  act "${APT[@]}" install proxmox-default-headers || stop headers "proxmox-default-headers failed"
+  local k; k="$(newk)" || stop kernel-pin "cannot read the kernel list"
+  act sh "$NV_PATH" --dkms --silent --kernel-name="$k" || stop nvidia-run "$NV_RUN --dkms --silent --kernel-name=$k failed (log)"
+  # persistenced: before the reboot (the running kernel is not $k, nvidia is built for $k only) install.sh cannot succeed -
+  # its failed start rolls back the user, the unit and the enable - so the minimal unit (root, no user) is enabled, not started;
+  # on $k the .run's own sample installs it and a failure STOPs (an empty M4000 without it draws ~45 W)
+  local smp="$R/usr/share/doc/NVIDIA_GLX-1.0/samples/nvidia-persistenced-init.tar.bz2" rk; rk="$(q uname -r)"
+  if [ -f "$smp" ] && [ -n "$rk" ] && [ "$rk" = "$k" ]; then
+    act tar -xjf "$smp" -C "$S" || stop persistenced "cannot unpack $smp"
+    act sh "$S/nvidia-persistenced-init/install.sh" systemd || stop persistenced "nvidia-persistenced-init install failed (log)"
+  else
+    put "$R/etc/systemd/system/nvidia-persistenced.service" "$(printf '[Unit]\nDescription=NVIDIA Persistence Daemon\nWants=syslog.target\n\n[Service]\nType=forking\nExecStart=/usr/bin/nvidia-persistenced\nExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced\n\n[Install]\nWantedBy=multi-user.target\n')"
+    [ "$rk" = "$k" ] || say "persistenced: the minimal unit, enabled not started - the running ${rk:-?} has no nvidia module (built for $k); recheck requires it active after the reboot"
+  fi
+  act systemctl daemon-reload || stop persistenced "systemctl daemon-reload failed"
+  act systemctl enable nvidia-persistenced || stop persistenced "systemctl enable nvidia-persistenced failed"
+  if later "dkms status lists nvidia for $k"; then
+    chk dkms "$(b dkms_ok "$k")" "nvidia not built for the new kernel $k - no reboot"
+  fi
+}
+ph_reboot() {
+  if later "every NIC name the config uses is pinned"; then local ok=0; nics_ok && ok=1; chk nic-pinning "$ok" "NIC names not pinned: $NICMISS- reboot refused"; fi
+  reboot_now reboot
+  [ "$APPLY" = 0 ] || exit 0
+}
+# JSON from pveum/pvesh through core perl (JSON::PP): jrows '<perl over $o>' prints one line per object of the array
+jrows() { perl -MJSON::PP -0777 -ne 'my $d = eval { decode_json($_) }; die "not JSON\n" unless defined $d; for my $o (ref $d eq "ARRAY" ? @$d : ($d)) { '"$1"' }'; }
+tokens() {    # the NAMES of every API token (user!tokenid) - never a value; a user whose list fails is logged and skipped
+  local u o us; us="$(q pveum user list --output-format json | jrows 'print "$o->{userid}\n" if defined $o->{userid}' | sort)"
+  for u in $us; do
+    o="$(q pveum user token list "$u" --output-format json)" || { say "tokens: cannot list $u"; continue; }
+    U="$u" jrows 'print "$ENV{U}!$o->{tokenid}\n" if defined $o->{tokenid}' <<<"$o"
+  done | sort
+}
+bkjobs() { q pvesh get /cluster/backup --output-format json | jrows 'print "$o->{id} ", ($o->{schedule} // "-"), "\n"' | sort; }
+jmd5() { cat "$R/etc/pve/jobs.cfg" 2>/dev/null | md5sum | cut -d' ' -f1; }
+vzrun() {     # sets VZ: running vzdump tasks in the cluster; a failing pvesh or output that is not JSON is a STOP, never "none"
+  local o; o="$(q pvesh get /cluster/tasks --output-format json)" || stop vzdump "pvesh get /cluster/tasks failed: ${o%%$'\n'*}"
+  VZ="$(jrows 'print "$o->{upid}\n" if ($o->{type} // "") eq "vzdump" && (!defined $o->{endtime} || ($o->{status} // "running") eq "running")' <<<"$o" 2>/dev/null)" \
+    || stop vzdump "pvesh get /cluster/tasks: not JSON: ${o:0:80}"; VZ="$(printf '%s' "$VZ" | tr '\n' ' ')"; }   # never a here-string: it adds a newline, so "" became " "
+roles() { q pveum role list --output-format json | jrows 'print "$o->{roleid} ", join(",", sort split /,\s*/, $o->{privs} // ""), "\n" unless $o->{special}' | sort; }
+acls() { q pveum acl list --output-format json | jrows 'print join(" ", map { $o->{$_} // "-" } qw(path type ugid roleid propagate)), "\n"' | sort; }
+rpcs() { q rpcinfo -p localhost | awk '$1 ~ /^[0-9]+$/ {print $1, $2, $3}' | sort -u; }   # never the port column: it moves
+bksched() {   # an enabled backup job due within BK_WINDOW_MIN STOPs; PVE's own analyzer reads the schedule (systemd's refuses */30)
+  local id en sc o j a ns
+  j="$(q pvesh get /cluster/backup --output-format json)" || stop backup-schedule "pvesh get /cluster/backup failed: ${j%%$'\n'*}"
+  o="$(jrows 'print "$o->{id} ", ($o->{enabled} // 1), " ", ($o->{schedule} // "-"), "\n"' <<<"$j" 2>/dev/null)" \
+    || stop backup-schedule "pvesh get /cluster/backup: not JSON: ${j:0:80}"
+  while read -r id en sc; do [ -n "$id" ] && [ "$en" != 0 ] || continue
+    [ "$sc" = - ] && { say "WARN backup job $id: no schedule"; continue; }
+    if ! a="$(q pvesh get /cluster/jobs/schedule-analyze --schedule "$sc" --iterations 1 --output-format json)"; then
+      grep 'Parameter verification failed' >/dev/null <<<"$a" \
+        && { say "WARN backup job $id: schedule '$sc' - schedule-analyze cannot parse it: ${a%%$'\n'*}"; continue; }
+      stop backup-schedule "schedule-analyze failed for backup job $id: ${a%%$'\n'*}"
+    fi
+    ns="$(jrows 'print "$o->{timestamp}\n"; last' <<<"$a" 2>/dev/null)" && [[ "$ns" =~ ^[0-9]+$ ]] \
+      || stop backup-schedule "schedule-analyze for backup job $id: no next run in its answer: ${a:0:80}"
+    chk backup-schedule "$(b [ $((ns - $(date +%s))) -gt $((BK_WINDOW_MIN * 60)) ])" "backup job $id runs at $(date -d "@$ns" '+%F %T %Z') - wait, or disable job $id for the upgrade AND re-enable it before recheck (recheck compares jobs.cfg to precheck's record)"
+  done <<<"$o"
+}
+gates() {     # before to-8.4, upgrade and reboot: the run that cuts the service holds them, not only the run that began at precheck
+  bootk
+  bksched; vzrun; chk vzdump "$(b [ -z "$VZ" ])" "a vzdump task runs in the cluster: $VZ- never upgrade under a backup"
+  [ "$NFS_SERVER" = yes ] || return 0
+  [ "$NFSQ" = 1 ] || say "nfs server: confirm the share is idle (no backup job, no transfer running), then rerun with --nfs-quiet"
+  chk nfs-quiet "$(b [ "$NFSQ" = 1 ])" "this node exports the share: confirm no node holds files on it, then --nfs-quiet (this run only)"
+}
+# name|command: what precheck records and recheck compares (backups, permissions; the NFS server's view)
+BKREC=("pve-roles|roles" "pve-acl|acls" "pve-tokens|tokens" "pve-bkjobs|bkjobs" "pve-jobsmd5|jmd5")
+NFSREC=("nfs-exports|q exportfs -v" "nfs-versions|cat $R/proc/fs/nfsd/versions 2>/dev/null" "nfs-conf|q nfsconf --dump"
+  "nfs-rpc|rpcs" "nfs-exportmnt|expmnt")
+expmnt() { local e; for e in $(q exportfs -v | awk '$1 ~ /^\//{print $1}' | sort -u); do q findmnt -n -T "$e"; echo; done; }
+recall() { local x; for x in "$@"; do rec "${x%%|*}" "$(eval "${x#*|}")"; done; }
+blnorm() { sed -E 's/[[:blank:]]+/ /g; s/ $//'; }   # runs of blanks -> one space, trailing blanks dropped: findmnt's column padding moved with util-linux; the record is never rewritten
+oldtok_ok() {   # an older record held only token ids, of OLD_TOKEN_USER's tokens (profile key); no user set: every recorded id must still exist
+  local live; live="$(tokens)"
+  if [ -n "$OLD_TOKEN_USER" ]; then [ "$(awk -F'!' -v u="$OLD_TOKEN_USER" '$1==u{print $2}' <<<"$live" | sort | blnorm)" = "$(sort "$S/pve-tokens" | blnorm)" ]
+  else [ -z "$(sed 's/^[^!]*!//' <<<"$live" | sort | comm -13 - <(sort "$S/pve-tokens" | grep .))" ]; fi; }
+rediff() { local x; for x in "$@"; do   # a record precheck never made (state set by hand) is said, not failed
+  [ -f "$S/${x%%|*}" ] || { say "recheck: no record ${x%%|*}"; continue; }
+  if [ "${x%%|*}" = pve-tokens ] && grep -q . "$S/pve-tokens" && ! grep -q '!' "$S/pve-tokens"; then oldtok_ok || bad+=("pve-tokens differs from precheck's record"); continue; fi
+  [ "$(eval "${x#*|}" | blnorm)" = "$(blnorm < "$S/${x%%|*}")" ] || bad+=("${x%%|*} differs from precheck's record"); done; }
+bk_pre() {    # never upgrade under a backup or with a setting PVE 9 drops
+  local m; m="$(grep -lE '^[[:space:]]*maxfiles' "$R/etc/pve/jobs.cfg" "$R/etc/pve/storage.cfg" "$R/etc/vzdump.conf" 2>/dev/null | tr '\n' ' ')"
+  chk maxfiles "$(b [ -z "$m" ])" "maxfiles in $m- PVE 9 drops it: use prune-backups"
+  vzrun; chk vzdump "$(b [ -z "$VZ" ])" "a vzdump task runs in the cluster: $VZ- never upgrade under a backup"
+  if command -v pve8to9 > /dev/null; then
+    o="$(p89)"; chk vm-monitor "$(grep '^FAIL:.*VM\.Monitor' <<<"$o" > /dev/null && echo 0 || echo 1)" "pve8to9: a custom role uses VM.Monitor - fix the role first"; fi
+  later "records: ${BKREC[*]%%|*}" && recall "${BKREC[@]}"
+}
+nfs_pre() {
+  later "records: nfs-mounts (findmnt -t nfs,nfs4)" && rec nfs-mounts "$(q findmnt -t nfs,nfs4 -o TARGET,OPTIONS)"
+  [ "$NFS_SERVER" = yes ] || return 0
+  later "records: ${NFSREC[*]%%|*}" && recall "${NFSREC[@]}"
+  [ "$NFSQ" = 1 ] || say "nfs server: confirm the share is idle (no backup job, no transfer running), then rerun with --nfs-quiet"
+  chk nfs-quiet "$(b [ "$NFSQ" = 1 ])" "this node exports the share: confirm no node holds files on it, then --nfs-quiet (one run)"
+}
+PROBEF=""; cleanp() { [ -z "$PROBEF" ] || timeout 5 rm -f -- "$PROBEF" 2>/dev/null; PROBEF=""; }
+probe() {     # write/read/delete under the share, bounded: a timeout is a FAIL, never a wait; the file goes on every path
+  local rc; PROBEF="$R$SHARED/.pve-upgrade-probe.$HOST.$$"; trap cleanp EXIT
+  timeout 20 sh -c 'echo probe > "$1" && [ "$(cat "$1")" = probe ] && rm -f -- "$1"' sh "$PROBEF"; rc=$?; cleanp; return $rc; }
+# options a newer kernel prints for an unchanged mount (7.0 adds fatal_neterrors=none after hard); any other new
+# option still fails until a slice adds it here - fail-closed: an unknown option is a difference
+NFS_IGNORE='^fatal_neterrors='
+nfsnorm() {   # findmnt TARGET,OPTIONS lines -> target + options sorted, NFS_IGNORE dropped; the record file is never rewritten
+  local t o; while read -r t o || [ -n "$t" ]; do   # q and rec drop the last newline
+    printf '%s %s\n' "$t" "$(tr , '\n' <<<"$o" | grep -vE "$NFS_IGNORE" | sort | paste -sd, -)"; done; }
+bkn_re() {    # recheck: appends to bad[]
+  rediff "${BKREC[@]}"
+  if [ -n "$SHARED" ]; then
+    [ ! -f "$S/nfs-mounts" ] || [ "$(q findmnt -t nfs,nfs4 -o TARGET,OPTIONS | nfsnorm)" = "$(nfsnorm < "$S/nfs-mounts")" ] || bad+=("nfs mounts differ from precheck's record")
+    local sn="${SHARED##*/}"
+    if [ "$(q pvesm status | awk -v n="$sn" '$1 == n {print $3}')" = active ]; then
+      probe || bad+=("$SHARED: write/read/delete probe failed or timed out (20 s)")
+    else bad+=("pvesm: storage $sn not active"); fi
+  else say "nfs: skipped: no SHARED"; fi
+  [ "$NFS_SERVER" = yes ] || return 0
+  rediff "${NFSREC[@]}"
+  for u in nfs-server rpcbind nfs-mountd; do q systemctl is-active "$u" > /dev/null || bad+=("$u not active"); done
+}
+ph_recheck() {
+  local bad=() n u f nic o
+  p89_ok || bad+=("pve8to9: $P89")
+  quorate || bad+=("pvecm: not quorate")
+  if [ -f "$S/expect-kernel" ]; then o="$(q uname -r)"   # the kernel reboot_now expected; no record is said, not failed (rediff's rule)
+    [ "$o" = "$(cat "$S/expect-kernel")" ] || bad+=("booted $o, expected $(cat "$S/expect-kernel")")
+  else say "recheck: no record expect-kernel"; fi
+  if [ "${GPU:-}" = yes ] && [ "$GPUS" = 0 ]; then say "recheck: no GPU on this host - module checks only"
+    if ! u="$(newk)"; then bad+=("dkms: cannot read the kernel list"); else dkms_ok "$u" || bad+=("dkms: nvidia not built for $u"); fi
+    ls "$R/lib/modules/$(q uname -r)/updates/dkms/"nvidia.ko* > /dev/null 2>&1 || bad+=("no nvidia.ko for $(q uname -r)")
+  elif [ "${GPU:-}" = yes ]; then
+    n="$(q nvidia-smi -L | grep -c '^GPU ')"; [ "$n" -ge "$GPUS" ] || bad+=("nvidia-smi: $n GPU(s), profile has $GPUS")
+    q systemctl is-active nvidia-persistenced > /dev/null || bad+=("nvidia-persistenced not active")
+    n="$(q nvidia-smi -q | grep -cE '^[[:space:]]*Persistence Mode[[:space:]]*: Enabled')"
+    [ "$n" -ge "$GPUS" ] || bad+=("persistence mode enabled on $n card(s), profile has $GPUS")
+  else say "recheck: GPU lines skipped (driver decision ${GPU:-none})"; fi
+  for nic in $NICS; do
+    o="$(q ethtool -k "$nic")"
+    for f in tcp-segmentation-offload generic-segmentation-offload generic-receive-offload; do
+      grep "^$f: off" <<<"$o" > /dev/null || bad+=("$nic: $f not off")
+    done
+  done
+  [ -z "$SHARED" ] || q findmnt -n "$SHARED" > /dev/null || bad+=("$SHARED not mounted")
+  for u in $UNITS; do unit_re "$u"; done
+  for f in $FILES; do [ -e "$R$f" ] || bad+=("$f missing"); done
+  if o="$(q systemctl --failed --no-legend --plain)"; then   # a unit masked after it failed stays listed until reset-failed
+    f="$(cat "$S/failed-units" 2>/dev/null)"; n=""
+    for u in $(awk '{print ($1 == "●" ? $2 : $1)}' <<<"$o"); do
+      case " $f " in *" $u "*) say "already failed before (precheck's record): $u";; *) n+="$u ";; esac; done
+    [ -z "$n" ] || bad+=("failed-units: ${n% }")
+  else bad+=("systemctl --failed unreadable"); fi
+  [ -z "$ZFS_POOL" ] || zfs_re
+  if later "backups, permissions, NFS match precheck's records"; then bkn_re; fi
+  if [ "$APPLY" = 1 ]; then repos_re
+  else echo "  would: recheck apt-get update (no Err:/W:/E:/Ignoring file), proxmox-ve's candidate from download.proxmox.com trixie/pve-no-subscription, no enabled bookworm or enterprise source"; fi
+  if [ "${#bad[@]}" -gt 0 ]; then
+    printf '  FAIL %s\n' "${bad[@]}"; logl "recheck failures: ${bad[*]}"
+    [ "$APPLY" = 1 ] && { echo "STOP recheck: ${#bad[@]} failure(s): ${bad[*]}" >&2; exit 1; }
+    DRYFAIL=1; return 0
+  fi
+  echo "RECHECK OK $HOST"; logl "RECHECK OK $HOST"
+}
+
+DRYFAIL=0; GPU=""; RAN=0   # RAN: a phase ran in this invocation (a rerun that starts at reboot does not pause again)
+last="$(cat "$STATE" 2>/dev/null)"; done_idx=-1
+for i in "${!PHASES[@]}"; do [ "${PHASES[$i]}" = "$last" ] && done_idx=$i; done
+DUE="${PHASES[$((done_idx + 1))]:-}"
+fetch_idx=-1; for i in "${!PHASES[@]}"; do [ "${PHASES[$i]}" = fetch ] && fetch_idx=$i; done
+up_idx=-1; for i in "${!PHASES[@]}"; do [ "${PHASES[$i]}" = upgrade ] && up_idx=$i; done
+REPROBE=0; [ "$WHAT" = fetch ] && [ "$done_idx" -ge "$fetch_idx" ] && [ "$done_idx" -lt "$up_idx" ] && [ "$fetch_idx" -ge 0 ] && REPROBE=1   # past fetch, before upgrade: fetch may only re-record $S/repos
+if [ "$APPLY" = 1 ]; then
+  mkdir -p "$S"; logl "start: $HOST $WHAT --apply (state ${last:-none})"
+  if [ "$REPROBE" = 1 ]; then PH=fetch; guards; repos_fetch; say "repos re-probed and re-recorded in $S/repos; state stays ${last}"; exit 0; fi
+  [ "$NFSQ" = 0 ] || logl "APPLY --nfs-quiet: the operator confirmed the share idle - this run only"
+  PH="${DUE:-recheck}"
+  [ -n "$DUE" ] || { [ "$WHAT" = all ] && { echo "every phase done (state $last)"; exit 0; }; stop order "every phase is done - nothing to run"; }
+  [ "$WHAT" = all ] || [ "$WHAT" = "$DUE" ] || stop order "the next due phase is $DUE, not $WHAT - state moves forward only"
+  guards
+else
+  echo "DRY RUN (no --apply): nothing is changed - $HOST ($NAME), nvidia=$NVIDIA"
+  PH=driver; gpu_decide
+fi
+for i in "${!PHASES[@]}"; do
+  PH="${PHASES[$i]}"
+  [ "$WHAT" = all ] || [ "$WHAT" = "$PH" ] || continue
+  if [ "$WHAT" = all ] && [ "$i" -le "$done_idx" ]; then [ "$APPLY" = 1 ] || echo "== $PH (done)"; continue; fi
+  if [ "$APPLY" = 1 ] && [ "$WHAT" = all ] && [ "$PH" = reboot ] && [ "$THRU" = 0 ] && [ "$RAN" = 1 ]; then   # the reboot is announced first: ssh is down during the dist-upgrade
+    echo "NEXT reboot: announce it, then \`./pve-upgrade $HOST reboot --apply\` (or all --apply)"; logl "pause before reboot (state driver)"; exit 0
+  fi
+  echo "== $PH"; logl "phase $PH"; RAN=1
+  if [ "$APPLY" = 1 ] && [[ ! "$PH" =~ ^(precheck|preclean|fetch|drain|recheck)$ ]]; then running; fi   # drain is `running` itself; fetch and preclean (kernels via apt, lists backups, touches no guest) run beside guests
+  if [ "$APPLY" = 1 ] && [[ "$PH" =~ ^(to-8.4|upgrade|reboot)$ ]]; then gates; fi
+  case "$PH" in to-8.4) ph_to84;; *) "ph_$PH";; esac
+  if [ "$APPLY" = 1 ]; then wr "$STATE" "$PH"; logl "phase $PH done"; [ "$PH" != precheck ] || wr "$S/failed-units" "$FU"; fi
+done
+[ "$APPLY" = 1 ] && exit 0
+[ "$DRYFAIL" = 0 ] && { echo "dry run: every check that can run now passed"; exit 0; }
+echo "dry run: FAIL lines above"; exit 1
