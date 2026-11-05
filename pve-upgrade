@@ -557,12 +557,16 @@ removals_guard() {  # upgrade, before anything changes: the trixie simulation ag
   act "${APT[@]}" "${TO[@]}" update || { rm -rf -- "$t"; stop apt-update "apt-get update on trixie (temp sources) failed (log)"; }
   sim="$(q "${APT[@]}" "${TO[@]}" -s dist-upgrade)" || { rm -rf -- "$t"; stop apt-sim "apt-get -s dist-upgrade to trixie failed (log)"; }
   rm -rf -- "$t"
-  for n in $(remv_list <<<"$sim"); do case " $REMOVE_OK " in *" $n "*) say "removal accepted (REMOVE_OK): $n";; *) bad+="$n ";; esac; done
-  [ -z "$bad" ] || stop removals "${bad}- name them in the profile's REMOVE_OK to accept"
+  removals_check "$(remv_list <<<"$sim")"
+}
+removals_check() {  # $1: the non-rename Remv names, one per line; each outside REMOVE_OK STOPs the run, with the line to add (fetch and upgrade both call it)
+  local n bad=""
+  for n in $1; do case " $REMOVE_OK " in *" $n "*) say "removal accepted (REMOVE_OK): $n";; *) bad+="$n ";; esac; done
+  [ -z "$bad" ] || stop removals "${bad}- name them in the profile's REMOVE_OK to accept, after reviewing them (README, Package removals): REMOVE_OK=\"$(echo $REMOVE_OK $bad)\""
 }
 archm() { du -sm --apparent-size "$R/var/cache/apt/archives" 2>/dev/null | cut -f1; }   # MB of fetched .debs
 ph_fetch() {  # download only, before the window (guests may run): /var/cache/apt and a temp dir, never /etc/apt; the bookworm
-  local t n after a1  # update refreshes the live lists (as pve-daily-update does) - only the trixie half is isolated
+  local t n after a1 rsim=""  # update refreshes the live lists (as pve-daily-update does) - only the trixie half is isolated
   if [ "$REPROBE" = 1 ]; then echo "  would: re-probe and re-record $S/repos only (fetch is past; the state does not move)"; repos_fetch; return; fi
   ceph_decide; repos_fetch
   act "${APT[@]}" update || stop apt-update "apt-get update failed (log)"
@@ -577,7 +581,7 @@ ph_fetch() {  # download only, before the window (guests may run): /var/cache/ap
     act "${APT[@]}" "${o[@]}" update || { rm -rf -- "$t"; stop apt-update "apt-get update on trixie (temp sources) failed (log)"; }
     act "${APT[@]}" "${o[@]}" -d dist-upgrade || { rm -rf -- "$t"; stop apt-fetch "apt-get -d dist-upgrade to trixie failed (log)"; }
     local sim; sim="$(q "${APT[@]}" "${o[@]}" -s dist-upgrade)" || { rm -rf -- "$t"; stop apt-sim "apt-get -s dist-upgrade to trixie failed (log)"; }
-    sim="$(remv_list <<<"$sim")"; rec removals "$sim"
+    sim="$(remv_list <<<"$sim")"; rec removals "$sim"; rsim="$sim"
     say "removals in the trixie dist-upgrade, not t64 renames: ${sim:-none}${sim:+ - REMOVE_OK in the profile accepts them at upgrade}"
     if [ "${GPU:-}" = yes ]; then   # driver's `install proxmox-default-headers` is a download of its own
       act "${APT[@]}" "${o[@]}" -d install proxmox-default-headers || { rm -rf -- "$t"; stop apt-fetch "apt-get -d install proxmox-default-headers (trixie) failed (log)"; }
@@ -587,6 +591,7 @@ ph_fetch() {  # download only, before the window (guests may run): /var/cache/ap
   a1="$(archm)"; say "fetched archive: ${a1:-?} MB"
   after="$(freeg)"   # preclean emptied the archive, so all of it is fetch's (this run's or an earlier one's) - the space the 10 GB is for
   chk free "$(b [ $(( ${after:-0} * 1024 + ${a1:-0} )) -ge 10240 ])" "${after:-?} GB on / after fetch + ${a1:-?} MB in the archive, need >= 10 GB"
+  [ -z "$rsim" ] || removals_check "$rsim"   # last, so a rerun after the profile is edited downloads nothing more
 }
 ph_drain() { running; }
 recover() {   # a host reset mid-unpack boots half-upgraded, maybe with no network: finish dpkg from the fetched cache, offline

@@ -31,7 +31,7 @@ cp driver.conf.example driver.conf    # NVIDIA nodes only; put the .run it names
 ./pve-upgrade mynode          # dry run: every phase, what it would run, the checks that can run now
 ./pve-upgrade mynode precheck --apply
 ./pve-upgrade mynode preclean --apply
-./pve-upgrade mynode fetch --apply    # the day before: downloads everything, changes no config
+./pve-upgrade mynode fetch --apply    # the day before: downloads everything, changes no config; STOPs on removals you must review
 # in the window, with the guests drained:
 ./pve-upgrade mynode all --apply      # stops before the reboot: "NEXT reboot: announce it ..."
 ./pve-upgrade mynode reboot --apply   # (or all --apply again); after the reboot:
@@ -51,7 +51,7 @@ driver → reboot without the pause. `--gpu yes|no` settles a disagreement betwe
 |---|---|---|
 | `precheck` | hostname, quorum, free space, failed units, NIC with no device, pins, backups running or due, `maxfiles`, repos, ZFS, `pve8to9`, intel-microcode, driver sha256 | records roles, ACLs, API token names, backup jobs, NFS and ZFS state; backs up `/etc` |
 | `preclean` | kernel packages in a half state; apt simulation | purges old kernels via apt, caches, old logs; lists (never removes) backups and ISOs; ≥ 10 GB free after |
-| `fetch` | trixie dist-upgrade simulation, removals | downloads the 8.4 and 9 packages to `/var/cache/apt`; probes third-party repos; writes no apt config |
+| `fetch` | trixie dist-upgrade simulation, removals (STOPs on any not in REMOVE_OK) | downloads the 8.4 and 9 packages to `/var/cache/apt`; probes third-party repos; writes no apt config |
 | `drain` | no running guest, no `GUARD_PROCS` process, `STAY` guests down | nothing |
 | `to-8.4` | gates (backup due, vzdump running, NFS quiet), pin, 8.4.1+ , `pve8to9` | **point of no return (small):** bookworm dist-upgrade; reboots if the kernel changed |
 | `prepare` | duplicate MACs, `pve8to9` FAILURES: 0 | pins NIC names, rebuilds initramfs, removes the systemd-boot meta-package (GRUB hosts), purges Debian `nvidia-*` |
@@ -93,6 +93,30 @@ A node that resets mid-upgrade boots half-upgraded, maybe without network: from 
 `--apply` — `recover` runs first, offline (`dpkg --configure -a`, `apt-get -f install --no-download` from the fetched cache).
 An API token record lists token **names** only, never a value.
 
+## Package removals
+
+Moving to Debian 13 removes packages whose names no longer exist there. A plain `t64` rename passes by itself. Anything else
+must be named in the profile's `REMOVE_OK`, or `fetch` and `upgrade` STOP, before either changes anything.
+
+**`fetch --apply` STOPs on this the day before, while your guests still run.** `precheck` can't show the list, because it needs Debian 13's package lists. `fetch` prints the names and a ready `REMOVE_OK=` line, and saves the list to `/root/pve-upgrade/removals`. Review the names, add the line to your profile, and rerun `fetch`: what it downloaded stays.
+
+How to read the list:
+
+- **Usually fine:** old library names and Python modules Debian 13 dropped or renamed. For example, one real node listed
+  `libgnutlsxx30 libqt5core5a libsmbclient libzfs4linux python3-distutils python3-future python3-lib2to3`. Yours may differ.
+- **Stop and find out why:** `proxmox-ve`, anything starting `pve-`, `qemu-server`, `zfsutils-linux`, `ceph` packages, or
+  something you installed on purpose. Don't add these to `REMOVE_OK`: on Proxmox, these on the list usually mean a wrong repository.
+- **Your own scripts:** apt lists every package that depends on a removed one, but it can't see software it didn't install,
+  such as a `pip` tool that uses `python3-future`. Check those yourself.
+
+To accept the list, put the names you reviewed in `hosts/mynode.conf`:
+
+```
+REMOVE_OK="libgnutlsxx30 python3-distutils"
+```
+
+`upgrade` runs the simulation again, because `to-8.4` can change the list. A new name STOPs it again, still before any change.
+
 ## Refusals
 
 | STOP | do |
@@ -104,7 +128,7 @@ An API token record lists token **names** only, never a value.
 | `kernel-pin` | `proxmox-boot-tool kernel unpin` |
 | `systemd-boot` | the node boots systemd-boot (or the removal would take more than the meta-package): decide by hand |
 | `subscription`, `ceph-repo` | not supported / upgrade Ceph to squid first |
-| `removals` | review the names, add them to `REMOVE_OK` |
+| `removals` | nothing has changed yet: review the names as in [Package removals](#package-removals), add them to `REMOVE_OK`, rerun |
 | `gpu decision` | rerun with `--gpu yes|no` |
 | `recheck` | each listed difference is a thing to look at before the node rejoins service |
 

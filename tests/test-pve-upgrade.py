@@ -843,8 +843,10 @@ r = go(c, d, env, "pvetest", "reboot", "--apply")
 check("h-c: --apply reboot, unpinned -> refused", "STOP reboot: nic-pinning" in r.stderr, True)
 
 # fetch pre-downloads bookworm and (with the keyring) trixie from upgrade's own .sources text, never touching /etc/apt
-def fetchcase(n, key=True, pre=None, **fake):
+def fetchcase(n, key=True, pre=None, ok=None, apply=True, **fake):
     c, d, root, env, host = make(n)
+    if ok is not None:
+        with open(d / "hosts/pvetest.conf", "a") as f: f.write('REMOVE_OK="%s"\n' % ok)
     if pre:
         (root / "var/cache/apt/archives").mkdir(parents=True); (root / "var/cache/apt/archives/old.deb").touch(); os.truncate(root / "var/cache/apt/archives/old.deb", pre)
     if key:
@@ -852,7 +854,7 @@ def fetchcase(n, key=True, pre=None, **fake):
     (root / "var/lib/apt/lists").mkdir(parents=True); (root / "var/lib/apt/lists/bookworm_Packages").write_text("x")
     apt0 = tree(root / "etc/apt"), tree(root / "var/lib/apt/lists")
     state(root, "preclean")
-    r = go(c, d, env, "pvetest", "fetch", "--apply", FAKE_QM="  101 web running\\n", **fake)
+    r = go(c, d, env, "pvetest", "fetch", *(["--apply"] if apply else []), FAKE_QM="  101 web running\\n", **fake)
     ac = [l for l in calls(c).splitlines() if l.startswith("apt-get ")]
     return c, root, r, ac, apt0 == (tree(root / "etc/apt"), tree(root / "var/lib/apt/lists"))
 c, root, r, ac, same = fetchcase("fm-a")
@@ -1165,10 +1167,21 @@ check("r4: [negative] a word differs -> FAIL", ("RECHECK OK" in r.stdout, "nfs-r
 
 # (6) removal guard: fetch records the non-rename Remv; upgrade STOPs on one REMOVE_OK does not name
 SIM = "Remv libssl3 [3.0.11]\\nRemv libcurl3-gnutls [7.88]\\nRemv zabbix-agent [1:6.0]\\nInst libssl3t64 (3.5)\\nInst libcurl3t64-gnutls (8.14)\\nInst zabbix-agent2 (7)\\n"
-c, root, r, ac, same = fetchcase("r6-fetch", FAKE_DU_SIM=SIM)
+c, root, r, ac, same = fetchcase("r6-fetch", ok="zabbix-agent", FAKE_DU_SIM=SIM)
 check("r6: fetch records only the non-rename Remv and says it", ((root / "root/pve-upgrade/removals").read_text().split(), "not t64 renames: zabbix-agent" in r.stdout, r.returncode),
       (["zabbix-agent"], True, 0))
 check("r6: fetch simulates on the temp sources", any(" -s dist-upgrade" in l and "sourceparts=" in l for l in ac), True)
+c, root, r, ac, same = fetchcase("r6-fa", FAKE_DU_SIM=SIM)
+check("r6: fetch STOPs on a Remv outside REMOVE_OK, state stays, list recorded, REMOVE_OK= line named [pin]",
+      (r.stderr.startswith("STOP fetch: removals: zabbix-agent - name them in the profile's REMOVE_OK to accept"), 'REMOVE_OK="zabbix-agent"' in r.stderr, state(root), (root / "root/pve-upgrade/removals").read_text().split()), (True, True, "preclean", ["zabbix-agent"]))
+c, root, r, ac, same = fetchcase("r6-fb", ok="zabbix-agent", FAKE_DU_SIM=SIM)
+check("r6: fetch with REMOVE_OK naming it passes, state moves", (r.returncode, state(root)), (0, "fetch"))
+c, root, r, ac, same = fetchcase("r6-fc", ok="a", FAKE_DU_SIM="Remv b [1]\\n")
+check("r6: the REMOVE_OK= line names the old names and the new one", ('REMOVE_OK="a b"' in r.stderr, state(root)), (True, "preclean"))
+c, root, r, ac, same = fetchcase("r6-fd", FAKE_DU_SIM="Remv libssl3 [3]\\nInst libssl3t64 (3.5)\\n")
+check("r6: fetch with only t64 renames passes", (r.returncode, state(root)), (0, "fetch"))
+c, root, r, ac, same = fetchcase("r6-fe", apply=False, FAKE_DU_SIM=SIM)
+check("r6: a dry fetch does not STOP", ("STOP" in r.stderr, r.returncode), (False, 0))
 c, d, root, env, sd = pmake("r6-up", third=False); state(root, "prepare")
 r = go(c, d, env, "pvetest", "upgrade", "--apply", FAKE_DU_SIM=SIM)
 dist = [l for l in calls(c).splitlines() if l.startswith("apt-get") and "dist-upgrade" in l and " -s " not in l]
@@ -1182,7 +1195,7 @@ check("r6: REMOVE_OK naming it passes", (r.returncode, state(root)), (0, "upgrad
 c, d, root, env, sd = pmake("r6-new", third=False); state(root, "prepare")
 with open(d / "hosts/pvetest.conf", "a") as f: f.write('REMOVE_OK="zabbix-agent"\n')
 r = go(c, d, env, "pvetest", "upgrade", "--apply", FAKE_DU_SIM=SIM + "Remv newpkg [1]\\n")
-check("r6: [negative] a Remv new since fetch and not in REMOVE_OK STOPs", (r.stderr.startswith("STOP upgrade: removals: newpkg - name them"), "zabbix-agent" in r.stderr, state(root)), (True, False, "prepare"))
+check("r6: [negative] a Remv new since fetch and not in REMOVE_OK STOPs", (r.stderr.startswith("STOP upgrade: removals: newpkg - name them"), "zabbix-agent" in r.stderr.split("REMOVE_OK=")[0], state(root)), (True, False, "prepare"))
 c, d, root, env, sd = pmake("r6-dry", third=False); state(root, "prepare"); (root / "root/pve-upgrade/removals").write_text("zabbix-agent\n")
 r = go(c, d, env, "pvetest", "upgrade")
 check("r6: a dry upgrade says the recorded list", "fetch recorded: zabbix-agent" in r.stdout, True)
