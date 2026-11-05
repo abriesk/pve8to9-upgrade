@@ -955,6 +955,7 @@ def mcase(n, vendor, **fake):
     return go(c, d, env, "pvetest", "precheck", "--apply", **fake), root
 r, root = mcase("t1o-d1", "GenuineIntel", FAKE_MC="")
 check("t1o-d1: Intel without intel-microcode -> STOP precheck: intel-microcode", (r.returncode, "STOP precheck: intel-microcode: not installed" in r.stderr), (1, True))
+check("t1o-d1b: the STOP names non-free-firmware and still says not installed", ("non-free-firmware" in r.stderr, "not installed (pve8to9 FAILs on it after the upgrade" in r.stderr), (True, True))
 r, root = mcase("t1o-d2", "GenuineIntel")
 check("t1o-d2: Intel with intel-microcode -> passes, recorded", (r.returncode, (root / "root/pve-upgrade/intel-microcode").read_text().strip()), (0, "install ok installed"))
 r, root = mcase("t1o-d3", "AuthenticAMD", FAKE_MC="")
@@ -1310,6 +1311,19 @@ r = go(c, d, env, "newhost", "precheck")
 check("g9-g: a missing profile's STOP says to run init", (r.returncode, "newhost init" in r.stderr), (2, True))
 r = go(c, d, env, "newhost", "init", "--apply")
 check("g9-g: init takes no --apply", r.returncode, 2)
+
+# a dry run of every phase from a fresh state (no state dir) prints no bash error line on stderr, for each example profile and the fixtures
+import re
+profs = [(f.stem, f) for f in sorted((SRC / "examples").glob("*.conf"))] + [(f.stem, f) for f in sorted(FIX.glob("*.conf"))]
+for pn, pf in profs:
+    c, d, root, env, host = make("fresh-" + pn)
+    shutil.copy(pf, d / "hosts" / f"{pn}.conf")
+    shutil.rmtree(root / "root/pve-upgrade")   # no state dir at all: a first-ever run
+    nm = dict(l.split("=", 1) for l in pf.read_text().splitlines() if "=" in l and not l.startswith("#")).get("NAME", pn).strip('"')
+    env["FAKE_HOSTNAME"] = nm
+    r = go(c, d, env, pn, "all")
+    bad = [l for l in r.stderr.splitlines() if re.search(r"line [0-9]+: ", l)]
+    check(f"dry-fresh {pn}: no 'line N:' on stderr", bad, [])
 
 
 shutil.rmtree(T)

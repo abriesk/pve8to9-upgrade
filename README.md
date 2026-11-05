@@ -60,6 +60,8 @@ driver → reboot without the pause. `--gpu yes|no` settles a disagreement betwe
 | `reboot` | NIC pinning, dkms built, ZFS healthy and cachefile, gates | **point of no return:** reboots |
 | `recheck` | booted kernel, `pve8to9`, quorum, GPUs, offloads, units, files, ZFS, NFS and backups equal to precheck's record, apt sources | sets a lost ZFS cachefile again |
 
+On an Intel host `precheck` stops until `intel-microcode` is installed; the package is in Debian's `non-free-firmware` component, so enable that on the host's Debian apt entries, `apt-get update`, then `apt-get install intel-microcode` (the script edits no sources for this).
+
 ## Profile keys (`hosts/<host>.conf`, shell assignments)
 
 | key | default | meaning |

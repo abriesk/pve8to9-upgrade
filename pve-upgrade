@@ -409,7 +409,7 @@ ph_precheck() {
   if [ "${GPU:-}" = yes ]; then chk sha256 "$(b sha_ok)" "$NV_PATH missing or its sha256 is not driver.conf's"; fi
   if grep -q '^vendor_id[[:space:]]*:[[:space:]]*GenuineIntel' "$R/proc/cpuinfo" 2>/dev/null; then
     local mc; mc="$(q dpkg-query -W -f='${Status}' intel-microcode)"
-    chk intel-microcode "$(b [ "$mc" = "install ok installed" ])" "not installed (pve8to9 FAILs on it after the upgrade - apt-get install intel-microcode first)"
+    chk intel-microcode "$(b [ "$mc" = "install ok installed" ])" "not installed (pve8to9 FAILs on it after the upgrade - enable the non-free-firmware component on the host's Debian apt entries, apt-get update, then apt-get install intel-microcode)"
     rec intel-microcode "$mc"
   fi
   chk etc-backup "$(b [ ! -e "$BAK" ])" "$BAK exists - it is the pre-upgrade copy, never overwritten"
@@ -540,7 +540,7 @@ trixie_tmp() {  # a temp dir with upgrade's trixie .sources: sets TT (the dir) a
 remv_list() {  # stdin: apt-get -s output; prints each Remv that is not a t64 rename (an Inst whose name minus t64 is the Remv: libssl3 -> libssl3t64), one per line
   awk '$1=="Inst"{i[$2]=1} ($1=="Remv"||$1=="Purg"){r[$2]=1} END{for(n in r){ ren=0; for(m in i){ t=m; sub(/t64/,"",t); if(t==n) ren=1 } if(!ren) print n }}' | sort -u; }
 removals_guard() {  # upgrade, before anything changes: the trixie simulation again; a Remv outside REMOVE_OK STOPs
-  local t sim bad="" n; [ "$APPLY" = 1 ] || { echo "  would: apt-get -s dist-upgrade on trixie (temp sources), STOP on a Remv that is not a t64 rename nor in REMOVE_OK (${REMOVE_OK:-none}); fetch recorded: $(tr '\n' ' ' < "$S/removals" 2>/dev/null)"; return 0; }
+  local t sim bad="" n; [ "$APPLY" = 1 ] || { echo "  would: apt-get -s dist-upgrade on trixie (temp sources), STOP on a Remv that is not a t64 rename nor in REMOVE_OK (${REMOVE_OK:-none}); fetch recorded: $(tr '\n' ' ' 2>/dev/null < "$S/removals")"; return 0; }
   trixie_tmp; t="$TT"; local f u e i=0 k plan src   # the real dist-upgrade also reads the switched third-party entries (repos_apply runs first) and every unplanned one
   while IFS=$'\t' read -r k u plan; do   # switch rows of the plan: the text from the backup (a rerun: the live entry is trixie already), else the live file
     [ "$plan" = switch ] || continue
