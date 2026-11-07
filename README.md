@@ -55,10 +55,10 @@ driver → reboot without the pause. `--gpu yes|no` settles a disagreement betwe
 | `drain` | no running guest, no `GUARD_PROCS` process, `STAY` guests down | nothing |
 | `to-8.4` | gates (backup due, vzdump running, NFS quiet), pin, 8.4.1+ , `pve8to9` | **point of no return (small):** bookworm dist-upgrade; reboots if the kernel changed |
 | `prepare` | duplicate MACs, `pve8to9` FAILURES: 0 | pins NIC names, rebuilds initramfs, removes the systemd-boot meta-package (GRUB hosts), purges Debian `nvidia-*` |
-| `upgrade` | gates, removal guard, repo plan | **point of no return:** trixie sources, `dist-upgrade`, disables enterprise sources |
+| `upgrade` | gates, removal guard, repo plan | **point of no return:** trixie sources, `dist-upgrade`, disables enterprise sources, keeps the LVM global_filter |
 | `driver` | .run sha256 | installs the NVIDIA .run with dkms for the new kernel, persistence daemon (skipped when no GPU) |
 | `reboot` | NIC pinning, dkms built, ZFS healthy and cachefile, gates | **point of no return:** reboots |
-| `recheck` | booted kernel, `pve8to9`, quorum, GPUs, offloads, units, files, ZFS, NFS and backups equal to precheck's record, apt sources | sets a lost ZFS cachefile again |
+| `recheck` | booted kernel, `pve8to9`, quorum, GPUs, offloads, units, files, ZFS, NFS and backups equal to precheck's record, apt sources, LVM global_filter | sets a lost ZFS cachefile again |
 
 On an Intel host `precheck` stops until `intel-microcode` is installed; the package is in Debian's `non-free-firmware` component, so enable that on the host's Debian apt entries, `apt-get update`, then `apt-get install intel-microcode` (the script edits no sources for this).
 
@@ -140,6 +140,7 @@ built the module for the kernel it will boot. Tested: Quadro M4000 (Maxwell), RT
 
 ## Lessons from real runs
 
+- **The LVM filter (fixed on 2026-11-08):** earlier versions of `upgrade` took the package's `lvm.conf`, which drops the `global_filter` Proxmox adds, so the host's LVM scans ZFS zvols and Ceph/NBD devices again. If you upgraded with an earlier version, run `lvmconfig devices/global_filter` on each node: anything without `r|/dev/zd.*|` means the filter is gone. To restore it, append to `/etc/lvm/lvm.conf` the block Proxmox writes (the four lines above), then `update-initramfs -u -k all`.
 - **A slow mirror:** copy the missing `.deb`s from an already-upgraded node's `/var/cache/apt/archives`, then `fetch --apply` again; apt checks them against the index.
 - **A NIC stanza with no device** stops `prepare` at NIC pinning; precheck now catches it a day early.
 - **A disabled unit restarted by the upgrade** (the dist-upgrade restarts services): `systemctl mask --now <unit>` for the run, unmask after `recheck`; disable alone is not enough.

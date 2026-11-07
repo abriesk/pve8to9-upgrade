@@ -684,8 +684,28 @@ ph_upgrade() {
   ent_off   # proxmox-ve 9 installs pve-enterprise.sources enabled: no subscription, every update would error
   for f in "${MAINT_CONFFILES[@]}"; do   # the maintainer's version for the fixed list; local kept as .pre-pve9
     if [ "$APPLY" = 0 ]; then echo "  would take maintainer $f if $f.dpkg-dist exists"
-    elif [ -f "$R$f.dpkg-dist" ]; then act cp -a "$R$f" "$R$f.pre-pve9"; act mv "$R$f.dpkg-dist" "$R$f"; fi
+      [ "$f" != /etc/lvm/lvm.conf ] || echo "  would take maintainer /etc/lvm/lvm.conf and carry its global_filter over"
+    elif [ -f "$R$f.dpkg-dist" ]; then act cp -a "$R$f" "$R$f.pre-pve9"; act mv "$R$f.dpkg-dist" "$R$f"
+      [ "$f" != /etc/lvm/lvm.conf ] || lvm_filter_carry; fi
   done
+}
+# lvm_filter_carry: the maintainer's lvm.conf has no global_filter (pve-manager appends it to the LOCAL file, which was just replaced):
+# append pve-manager's block with the old file's rules in their order, then each of zd/rbd/nbd it lacked; then the boot image
+lvm_filter_carry() {
+  local new="$R/etc/lvm/lvm.conf" old="$R/etc/lvm/lvm.conf.pre-pve9" line="" rules=() r list="" blk
+  if grep -Eq '^[[:space:]]*global_filter[[:space:]]*=' "$new"; then
+    say "lvm.conf: the maintainer's file already has a global_filter - left as it is"
+  else
+    line="$(grep -E '^[[:space:]]*global_filter[[:space:]]*=' "$old" 2> /dev/null | head -n1)"
+    while IFS= read -r r; do [ -z "$r" ] || rules+=("$r"); done < <(grep -o '"[^"]*"' <<<"$line")
+    for r in '"r|/dev/zd.*|"' '"r|/dev/rbd.*|"' '"r|/dev/nbd.*|"'; do
+      case " ${rules[*]:-} " in *" $r "*) ;; *) rules+=("$r");; esac; done
+    for r in "${rules[@]}"; do list+="${list:+,}$r"; done
+    blk=$'devices {\n     # added by pve-manager to avoid scanning ZFS zvols and Ceph rbds\n     global_filter=['"$list"$']\n}'
+    wr "$new" "$(cat "$new"; printf '\n%s' "$blk")"; logl "wrote $new"
+    say "lvm.conf: global_filter carried over: $list"
+  fi
+  act update-initramfs -u -k all || stop lvm-initramfs "update-initramfs -u -k all failed after replacing lvm.conf (log)"
 }
 ph_driver() {
   [ "${GPU:-}" = no ] && { say "driver phase: nothing to do (decision no)"; return 0; }
@@ -838,6 +858,9 @@ ph_recheck() {
   [ -z "$SHARED" ] || q findmnt -n "$SHARED" > /dev/null || bad+=("$SHARED not mounted")
   for u in $UNITS; do unit_re "$u"; done
   for f in $FILES; do [ -e "$R$f" ] || bad+=("$f missing"); done
+  if o="$(q lvmconfig devices/global_filter)"; then
+    [[ "$o" == *'r|/dev/zd.*|'* ]] || bad+=("lvm: global_filter has no r|/dev/zd.*| rule (README, The LVM filter)")
+  else bad+=("lvm: lvmconfig devices/global_filter failed: ${o:-no output} (README, The LVM filter)"); fi
   if o="$(q systemctl --failed --no-legend --plain)"; then   # a unit masked after it failed stays listed until reset-failed
     f="$(cat "$S/failed-units" 2>/dev/null)"; n=""
     for u in $(awk '{print ($1 == "●" ? $2 : $1)}' <<<"$o"); do

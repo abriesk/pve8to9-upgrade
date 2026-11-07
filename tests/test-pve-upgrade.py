@@ -60,6 +60,7 @@ SHIMS = {
     "apt-cache": 'printf "%b" "${FAKE_POLICY:-proxmox-ve:\\n  Installed: 9.0.3\\n  Candidate: 9.0.3\\n  Version table:\\n *** 9.0.3 500\\n        500 http://download.proxmox.com/debian/pve trixie/pve-no-subscription amd64 Packages\\n        100 /var/lib/dpkg/status\\n}"',
     "tar": '[ -n "${FAKE_TAR_ERR:-}" ] && [ "$1" = -czf ] && { : > "$2"; echo "$FAKE_TAR_ERR" >&2; exit ${FAKE_TAR_RC:-1}; }; PATH=/usr/bin:/bin exec tar "$@"',
     "update-initramfs": "exit 0",
+    "lvmconfig": 'echo "global_filter=${FAKE_GF:-[\\"r|/dev/zd.*|\\"]}"',
     "proxmox-boot-tool": '[ "${1:-}" = status ] && { [ -n "${FAKE_GRUB:-}" ] && { echo "E: /etc/kernel/proxmox-boot-uuids does not exist." >&2; exit 2; }; echo "4A2B-1C3D is configured with: uefi"; exit 0; }; [ "${1:-}" = refresh ] && { echo "skipping ESP sync"; exit 0; }; n=$(( $(cat "$FAKE_LOG.pbt" 2>/dev/null || echo 0) + 1 )); echo $n > "$FAKE_LOG.pbt"; [ -n "${FAKE_PBT_RC_FROM:-}" ] && [ $n -ge $FAKE_PBT_RC_FROM ] && { echo "E: no ESP configured"; exit 2; }; [ -z "${FAKE_PBT_RC:-}" ] || { echo "E: no ESP configured"; exit $FAKE_PBT_RC; }; [ -z "${FAKE_PBT_JUNK:-}" ] || { echo "usage: kernel <add|remove|list>"; exit 0; }; echo "Manually selected kernels:"; echo "None."; echo; echo "Automatically selected kernels:"; echo "6.8.12-9-pve"; [ -z "${FAKE_PIN:-}" ] || printf "\\nPinned kernel:\\n%s\\n" "$FAKE_PIN"; [ -z "${FAKE_NEXTPIN:-}" ] || printf "\\nKernel pinned on next-boot:\\n%s\\n" "$FAKE_NEXTPIN"',
     "pveum": 'case "$*" in "role list"*) echo "[{\\"roleid\\":\\"PVEAdmin\\",\\"special\\":1,\\"privs\\":\\"${FAKE_BUILTIN:-VM.Monitor}\\"},{\\"roleid\\":\\"mon\\",\\"special\\":0,\\"privs\\":\\"VM.Audit${FAKE_ROLES:-}\\"}]";;'
              ' "acl list"*) echo \'[{"path":"/","type":"user","ugid":"snapper@pve","roleid":"PVEAuditor","propagate":1}]\';;'
@@ -312,6 +313,50 @@ check("i: .run never ran", "nvrun" in calls(c), False)
 (root / "root/pve-upgrade/state").unlink()
 r = go(c, d, env, "host-a", "precheck", "--apply", FAKE_CARD=1)
 check("i: precheck refuses it too", any(l.startswith("STOP precheck: sha256") for l in r.stderr.splitlines()), True)
+
+# (j-lvm) upgrade keeps the LVM global_filter the maintainer's lvm.conf drops
+OLDGF = 'global_filter=["r|/dev/zd.*|","r|/dev/rbd.*|"]'
+NEWGF = '"r|/dev/zd.*|","r|/dev/rbd.*|","r|/dev/nbd.*|"'
+
+
+def lvm_case(n, old, dist, *args):
+    c, d, root, env, host = make(n)
+    (root / "etc/lvm").mkdir(parents=True)
+    if old is not None: (root / "etc/lvm/lvm.conf").write_text(old)
+    if dist is not None: (root / "etc/lvm/lvm.conf.dpkg-dist").write_text(dist)
+    state(root, "prepare")
+    r = go(c, d, env, "pvetest", "upgrade", *args)
+    return c, root, r
+
+
+DIST = "devices {\n    # maintainer\n}\n"
+OLD = "devices {\n    " + OLDGF + "\n}\n"
+c, root, r = lvm_case("jl-a", OLD, DIST, "--apply")
+t = (root / "etc/lvm/lvm.conf").read_text()
+check("jl-a: block with the three rules", ("global_filter=[" + NEWGF + "]" in t, "added by pve-manager" in t, r.returncode), (True, True, 0))
+check("jl-a: .pre-pve9 holds the old file", (root / "etc/lvm/lvm.conf.pre-pve9").read_text(), OLD)
+check("jl-a: update-initramfs -u -k all", "update-initramfs -u -k all" in calls(c), True)
+check("jl-a: line said", "lvm.conf: global_filter carried over: " + NEWGF in r.stdout, True)
+c, root, r = lvm_case("jl-b", OLD.replace('"r|/dev/rbd.*|"', '"r|/dev/rbd.*|","r|/dev/sdz.*|"'), DIST, "--apply")
+check("jl-b: extra rule kept in place, then nbd", 'global_filter=["r|/dev/zd.*|","r|/dev/rbd.*|","r|/dev/sdz.*|","r|/dev/nbd.*|"]' in (root / "etc/lvm/lvm.conf").read_text(), True)
+c, root, r = lvm_case("jl-c", "devices {\n}\n", DIST, "--apply")
+check("jl-c: old file without filter -> the three", "global_filter=[" + NEWGF + "]" in (root / "etc/lvm/lvm.conf").read_text(), True)
+HAS = 'devices {\n    global_filter=["r|/dev/zd.*|"]\n}\n'
+c, root, r = lvm_case("jl-d", OLD, HAS, "--apply")
+check("jl-d: dist has a filter -> nothing appended, said", ((root / "etc/lvm/lvm.conf").read_text(), "already has a global_filter" in r.stdout), (HAS, True))
+c, root, r = lvm_case("jl-e", OLD, None, "--apply")
+check("jl-e: no dpkg-dist -> untouched, no initramfs", ((root / "etc/lvm/lvm.conf").read_text(), "update-initramfs" in calls(c)), (OLD, False))
+c, root, r = lvm_case("jl-f", OLD, DIST)
+check("jl-f: dry run changes nothing, would-line", ((root / "etc/lvm/lvm.conf").read_text(), (root / "etc/lvm/lvm.conf.dpkg-dist").exists(),
+      "would take maintainer /etc/lvm/lvm.conf and carry its global_filter over" in r.stdout), (OLD, True, True))
+c, d, root, env, host = make("jl-g", "host-a")
+(root / "root/pve-upgrade/gpu").write_text("yes\n")
+state(root, "reboot")
+r = go(c, d, env, "host-a", "recheck", "--apply", FAKE_CARD=1, FAKE_GF='["r|/dev/rbd.*|"]')
+check("jl-g: no zd rule -> not OK, names it", ("RECHECK OK" in r.stdout, "global_filter has no r|/dev/zd.*| rule" in r.stdout + r.stderr), (False, True))
+state(root, "reboot")
+r = go(c, d, env, "host-a", "recheck", "--apply", FAKE_CARD=1)
+check("jl-g: with the rule -> OK", (r.returncode, "RECHECK OK" in r.stdout), (0, True))
 
 # (j) recheck: RECHECK OK only when every item passes; failures listed
 c, d, root, env, host = make("j", "host-a")
